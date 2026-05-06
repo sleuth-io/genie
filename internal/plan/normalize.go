@@ -10,9 +10,7 @@ import (
 	"log/slog"
 	"sort"
 
-	"github.com/anthropics/anthropic-sdk-go"
-
-	"github.com/mrdon/gqlspike/internal/engine"
+	"github.com/sleuth-io/genie/internal/engine"
 )
 
 // normalizeOutput is the JSON shape we ask Claude to produce on a normalize
@@ -50,19 +48,20 @@ func (g *Generator) normalizeNode(
 		"shape_hash", n.Shape().L1Hash()[:12],
 	)
 
-	resp, usage, err := g.callClaude(ctx, g.normalizeSystem, user)
+	resp, err := g.client.Generate(ctx, g.normalizeSystem, user)
 	if err != nil {
 		return nil, "", nil, nil, err
 	}
+	logUsage("normalize", resp.Usage)
 	g.metrics.NormalizeCalls++
-	g.metrics.NormalizeInputTokens += usage.InputTokens
-	g.metrics.NormalizeOutputTokens += usage.OutputTokens
-	g.metrics.CacheReadInputTokens += usage.CacheReadInputTokens
-	g.metrics.CacheCreationInputTokens += usage.CacheCreationInputTokens
+	g.metrics.NormalizeInputTokens += resp.Usage.InputTokens
+	g.metrics.NormalizeOutputTokens += resp.Usage.OutputTokens
+	g.metrics.CacheReadInputTokens += resp.Usage.CacheReadTokens
+	g.metrics.CacheCreationInputTokens += resp.Usage.CacheCreationTokens
 
-	out, err := parseNormalizeResponse(resp)
+	out, err := parseNormalizeResponse(resp.Text)
 	if err != nil {
-		return nil, "", nil, nil, fmt.Errorf("parse normalize response: %w (raw=%q)", err, truncate(resp, 500))
+		return nil, "", nil, nil, fmt.Errorf("parse normalize response: %w (raw=%q)", err, truncate(resp.Text, 500))
 	}
 
 	canonRaw, hash := stableHash(out.CanonicalSchema)
@@ -157,5 +156,3 @@ Literal shape (as written by the user):
 Now produce the JSON response.`, buf), nil
 }
 
-// Compile-time guard: the Anthropic Usage type stays available.
-var _ anthropic.Usage = anthropic.Usage{}

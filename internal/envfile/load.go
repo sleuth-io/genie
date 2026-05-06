@@ -18,11 +18,11 @@ import (
 // When set, the named file MUST exist; missing-file is treated as an
 // error so that a typo in the path doesn't silently fall back to a
 // wrong-but-present default.
-const PathEnvVar = "INTENT_GW_ENV_FILE"
+const PathEnvVar = "GENIE_ENV_FILE"
 
 // Load resolves which file to read and applies it. Behaviour:
 //
-//   - If INTENT_GW_ENV_FILE is set: read that path. Missing file is an error.
+//   - If GENIE_ENV_FILE is set: read that path. Missing file is an error.
 //   - Otherwise: read ./.env if present. Missing file is fine.
 //
 // In either mode, existing env vars take precedence over file contents.
@@ -43,7 +43,7 @@ func loadFile(path string, optional bool) error {
 		}
 		return fmt.Errorf("open env file %q: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	scanner := bufio.NewScanner(f)
 	lineNo := 0
@@ -53,9 +53,7 @@ func loadFile(path string, optional bool) error {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if strings.HasPrefix(line, "export ") {
-			line = strings.TrimPrefix(line, "export ")
-		}
+		line = strings.TrimPrefix(line, "export ")
 		eq := strings.IndexByte(line, '=')
 		if eq <= 0 {
 			return fmt.Errorf("%s:%d: malformed line (expected KEY=VALUE)", path, lineNo)

@@ -4,7 +4,7 @@ import (
 	"context"
 	"strings"
 
-	"github.com/mrdon/gqlspike/internal/runtime"
+	"github.com/sleuth-io/genie/internal/runtime"
 )
 
 // HostNamePrefix is prepended to MCP tool names when they're exposed as

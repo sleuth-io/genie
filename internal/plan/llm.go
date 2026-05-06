@@ -21,12 +21,12 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/mark3labs/mcp-go/mcp"
 
-	"github.com/mrdon/gqlspike/internal/crystallize"
-	"github.com/mrdon/gqlspike/internal/engine"
-	"github.com/mrdon/gqlspike/internal/mcpclient"
+	"github.com/sleuth-io/genie/internal/crystallize"
+	"github.com/sleuth-io/genie/internal/engine"
+	"github.com/sleuth-io/genie/internal/llm"
+	"github.com/sleuth-io/genie/internal/mcpclient"
 )
 
 // Generator wires an Anthropic client + tool catalog + crystallize store
@@ -43,10 +43,10 @@ import (
 //   2. GENERATE — big call, produces the monty script + io_schema.
 //      Only fires if L2 is also a miss.
 type Generator struct {
-	client          anthropic.Client
+	client          llm.Client
 	store           *crystallize.Store
-	generateSystem  []anthropic.TextBlockParam
-	normalizeSystem []anthropic.TextBlockParam
+	generateSystem  []llm.SystemBlock
+	normalizeSystem []llm.SystemBlock
 	toolNames       []string // monty-side names like github_list_pull_requests
 	tools           []mcp.Tool
 
@@ -88,15 +88,15 @@ func (g *Generator) NormalizeOnly(ctx context.Context, n *engine.Node) (string, 
 	return hash, err
 }
 
-// NewGenerator initialises the generator. Call once at startup. The system
-// prompt embeds the full MCP tool catalog and is marked cacheable; the
-// caller is responsible for ensuring ANTHROPIC_API_KEY is set in env.
-func NewGenerator(c *mcpclient.Client, store *crystallize.Store) *Generator {
+// NewGenerator initialises the generator. Call once per (provider, store)
+// scope. The LLM client is injected so callers can pick a backend
+// (Anthropic SDK, Claude Code CLI, …) per the rules in package llm.
+func NewGenerator(c *mcpclient.Client, store *crystallize.Store, llmClient llm.Client) *Generator {
 	tools := c.Tools()
 	catalog := renderToolCatalog(tools)
 
 	return &Generator{
-		client:          anthropic.NewClient(),
+		client:          llmClient,
 		store:           store,
 		generateSystem:  buildGenerateSystem(catalog),
 		normalizeSystem: buildNormalizeSystem(catalog),
@@ -191,70 +191,31 @@ func (g *Generator) fullGenerate(ctx context.Context, n *engine.Node, parent any
 		"shape_hash", n.Shape().L1Hash()[:12],
 	)
 
-	resp, usage, err := g.callClaude(ctx, g.generateSystem, userText)
+	resp, err := g.client.Generate(ctx, g.generateSystem, userText)
 	if err != nil {
-		return nil, fmt.Errorf("claude call: %w", err)
+		return nil, fmt.Errorf("llm call: %w", err)
 	}
+	logUsage("generate", resp.Usage)
 	g.metrics.GenerateCalls++
-	g.metrics.GenerateInputTokens += usage.InputTokens
-	g.metrics.GenerateOutputTokens += usage.OutputTokens
-	g.metrics.CacheReadInputTokens += usage.CacheReadInputTokens
-	g.metrics.CacheCreationInputTokens += usage.CacheCreationInputTokens
+	g.metrics.GenerateInputTokens += resp.Usage.InputTokens
+	g.metrics.GenerateOutputTokens += resp.Usage.OutputTokens
+	g.metrics.CacheReadInputTokens += resp.Usage.CacheReadTokens
+	g.metrics.CacheCreationInputTokens += resp.Usage.CacheCreationTokens
 
-	out, err := parseLLMResponse(resp)
+	out, err := parseLLMResponse(resp.Text)
 	if err != nil {
-		return nil, fmt.Errorf("parse llm response: %w (raw=%q)", err, truncate(resp, 500))
+		return nil, fmt.Errorf("parse llm response: %w (raw=%q)", err, truncate(resp.Text, 500))
 	}
 	return out, nil
 }
 
-// callClaude streams the message and accumulates the final result. Streaming
-// avoids HTTP timeouts on large system prompts (tool catalog can run 10K+
-// tokens) and is the recommended default for non-trivial input sizes.
-//
-// Returns the response text plus the Usage struct so the caller can attribute
-// tokens to the right call type (normalize vs generate).
-func (g *Generator) callClaude(ctx context.Context, system []anthropic.TextBlockParam, userText string) (string, anthropic.Usage, error) {
-	params := anthropic.MessageNewParams{
-		Model:     anthropic.ModelClaudeOpus4_7,
-		MaxTokens: 16000,
-		System:    system,
-		Thinking: anthropic.ThinkingConfigParamUnion{
-			OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{},
-		},
-		Messages: []anthropic.MessageParam{
-			anthropic.NewUserMessage(anthropic.NewTextBlock(userText)),
-		},
-	}
-
-	stream := g.client.Messages.NewStreaming(ctx, params)
-	msg := anthropic.Message{}
-	for stream.Next() {
-		if err := msg.Accumulate(stream.Current()); err != nil {
-			return "", anthropic.Usage{}, fmt.Errorf("accumulate stream event: %w", err)
-		}
-	}
-	if err := stream.Err(); err != nil {
-		return "", anthropic.Usage{}, fmt.Errorf("stream: %w", err)
-	}
-
-	logUsage(msg.Usage)
-
-	var text strings.Builder
-	for _, block := range msg.Content {
-		if tb, ok := block.AsAny().(anthropic.TextBlock); ok {
-			text.WriteString(tb.Text)
-		}
-	}
-	return text.String(), msg.Usage, nil
-}
-
-func logUsage(u anthropic.Usage) {
-	slog.Info("plan: claude usage",
+func logUsage(call string, u llm.Usage) {
+	slog.Info("plan: llm usage",
+		"call", call,
 		"input_tokens", u.InputTokens,
 		"output_tokens", u.OutputTokens,
-		"cache_create", u.CacheCreationInputTokens,
-		"cache_read", u.CacheReadInputTokens,
+		"cache_create", u.CacheCreationTokens,
+		"cache_read", u.CacheReadTokens,
 	)
 }
 
@@ -309,7 +270,7 @@ func truncate(s string, n int) string {
 // the cacheable tool catalog (cache breakpoint) followed by the script-
 // generation instructions. The tool catalog renders deterministically so
 // the prompt cache hits across calls.
-func buildGenerateSystem(catalog string) []anthropic.TextBlockParam {
+func buildGenerateSystem(catalog string) []llm.SystemBlock {
 	preamble := `You generate Python (Monty-on-WASM) scripts that resolve a single GraphQL node against the GitHub API via MCP host functions.
 
 The script you produce is invoked by the engine as:
@@ -421,11 +382,8 @@ Respond with a single JSON object, no prose, no markdown fence:
     }
 `
 
-	return []anthropic.TextBlockParam{
-		{
-			Text:         catalog,
-			CacheControl: anthropic.NewCacheControlEphemeralParam(),
-		},
+	return []llm.SystemBlock{
+		{Text: catalog, CacheBreakAfter: true},
 		{Text: preamble},
 	}
 }
@@ -457,7 +415,7 @@ func renderToolCatalog(tools []mcp.Tool) string {
 // buildNormalizeSystem assembles the system blocks for the NORMALIZE call.
 // Same cacheable tool catalog as Generate (so we get cache hits across both
 // call types), then the canonicalisation instructions.
-func buildNormalizeSystem(catalog string) []anthropic.TextBlockParam {
+func buildNormalizeSystem(catalog string) []llm.SystemBlock {
 	preamble := `You receive a GraphQL node — a (possibly hallucinated) field name, its argument names, and its recursive selection — and produce a canonical, normalised representation of the same intent.
 
 Two different surface phrasings with the same meaning MUST produce the same canonical schema. This is the LOAD-BEARING contract — getting it wrong fragments the cache and wastes a generation. Be aggressive about collapsing paraphrases.
@@ -577,11 +535,8 @@ Worked example for input `+"`{ openPRs(name: \"sdk\") { title num }`"+`:
       "field_rename": {"title": "title", "num": "number"}
     }
 `
-	return []anthropic.TextBlockParam{
-		{
-			Text:         catalog,
-			CacheControl: anthropic.NewCacheControlEphemeralParam(),
-		},
+	return []llm.SystemBlock{
+		{Text: catalog, CacheBreakAfter: true},
 		{Text: preamble},
 	}
 }
@@ -654,10 +609,3 @@ Parent context (already canonical-keyed; receive it as `+"`parent`"+`):
 Now produce the JSON response.`, shapeJSON, canonJSON, parentBlock), nil
 }
 
-func argMapFromNode(n *engine.Node) map[string]any {
-	out := make(map[string]any, len(n.Args))
-	for _, a := range n.Args {
-		out[a.Name] = a.Value
-	}
-	return out
-}

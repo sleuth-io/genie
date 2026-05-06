@@ -1,4 +1,4 @@
-# Curated eval set for the intent-gateway spike.
+# Curated eval set for genie.
 #
 # Each `intent` is one user goal. `query` is the canonical phrasing; each
 # entry under `paraphrases` is a different surface form of the same goal.

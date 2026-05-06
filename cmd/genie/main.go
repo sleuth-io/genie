@@ -1,10 +1,9 @@
-// Command intent-gw is the CLI + MCP-server entry point for the intent-gateway
-// spike. Subcommands:
+// Command genie is the CLI + MCP-server entry point for Genie, a smart
+// MCP client that fronts upstream MCP servers and shapes responses.
 //
-//	intent-gw query "<graphql>"   one-shot CLI: parse, resolve, print JSON.
-//	intent-gw serve               start MCP server exposing run_query.
-//	intent-gw eval                run the curated eval set, print metrics.
-//	intent-gw smoke               smoke-test the embedded monty runtime.
+//	genie query "<graphql>"   one-shot CLI: parse, resolve, print JSON.
+//	genie serve               start MCP server exposing run_query.
+//	genie eval                run the curated eval set, print metrics.
 package main
 
 import (
@@ -13,7 +12,8 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/mrdon/gqlspike/internal/envfile"
+	"github.com/sleuth-io/genie/internal/buildinfo"
+	"github.com/sleuth-io/genie/internal/envfile"
 )
 
 func main() {
@@ -44,16 +44,11 @@ func main() {
 		err = runServe(ctx, args)
 	case "eval":
 		err = runEval(ctx, args)
-	case "smoke":
-		err = runSmoke(ctx, args)
-	case "mcp-tools":
-		err = runMCPTools(ctx, args)
-	case "fixture":
-		err = runFixture(ctx, args)
-	case "probe":
-		err = runProbe(ctx, args)
 	case "-h", "--help", "help":
 		usage()
+		return
+	case "-v", "--version", "version":
+		fmt.Printf("genie %s (%s, %s)\n", buildinfo.Version, buildinfo.Commit, buildinfo.Date)
 		return
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", cmd)
@@ -68,7 +63,7 @@ func main() {
 
 // canonicalizeEnv copies values from project-specific aliases into the
 // canonical env vars the rest of the codebase reads. Lets a teammate point
-// the spike at an existing Sleuth .env without renaming entries; if the
+// Genie at an existing Sleuth .env without renaming entries; if the
 // canonical name is already set (manual export), the alias is ignored.
 func canonicalizeEnv() {
 	aliases := map[string]string{
@@ -86,21 +81,20 @@ func canonicalizeEnv() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `intent-gw — intent-gateway spike
+	fmt.Fprintf(os.Stderr, `genie — smart MCP client for agents
 
 Usage:
-  intent-gw query "<graphql>"   resolve one query, print JSON
-  intent-gw serve               start MCP server (run_query tool)
-  intent-gw eval                run curated eval set
-  intent-gw smoke               smoke-test embedded monty runtime
-  intent-gw mcp-tools           list tools advertised by github-mcp-server
-  intent-gw fixture             run a hand-written monty script vs. GitHub
+  genie query "<graphql>"   resolve one query, print JSON
+  genie serve               start MCP server (run_query, list_providers)
+  genie eval                run curated eval set
 
-Required env (set directly or via .env in CWD):
+Required env (set directly or via .env):
   GITHUB_PERSONAL_ACCESS_TOKEN  GitHub PAT, forwarded to github-mcp-server
   ANTHROPIC_API_KEY             Anthropic key for plan generation
 
 Optional:
-  INTENT_GW_ENV_FILE            override path to env file (default: ./.env)
+  GENIE_ENV_FILE                override path to env file (default: ./.env)
+  GENIE_CONFIG                  override path to config file
+  GENIE_CACHE_DIR               override cache directory
 `)
 }

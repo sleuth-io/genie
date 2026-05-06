@@ -1,69 +1,79 @@
-// Package mcpserver exposes the spike's resolution pipeline as a single
-// MCP tool — run_query(provider, query) — over stdio. This is the eventual
-// product surface; for the spike it lets Claude Desktop, mcp-inspector, or
-// any other MCP client drive the same engine the CLI uses.
+// Package mcpserver exposes Genie's resolution pipeline over MCP stdio.
+// It registers two tools: run_query (the headline tool — resolves a
+// GraphQL-shaped query against one of the fronted providers) and
+// list_providers (returns the configured provider names + descriptions
+// so the calling agent knows what's wired up).
 package mcpserver
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+
+	"github.com/sleuth-io/genie/internal/providers"
 )
 
-// QueryRunner is the minimal contract the tool needs: parse a GraphQL
-// string + execute, returning a `{aliasOrName: value, ...}` map. The
-// caller wires this to the live engine.Executor in cmd/intent-gw/serve.go.
-type QueryRunner func(ctx context.Context, query string) (map[string]any, error)
+// QueryRunner resolves a query against a named provider. The implementation
+// is responsible for looking the provider up; an unknown name should
+// surface as a normal Go error.
+type QueryRunner func(ctx context.Context, provider, query string) (map[string]any, error)
 
-// SupportedProviders are the values accepted for the `provider` arg today.
-// Spike scope is GitHub-only; multi-provider routing lands later.
-var SupportedProviders = []string{"github"}
+// ProviderLister returns the live provider catalogue the MCP tools
+// describe. Decoupled from a concrete *providers.Registry so tests can
+// supply their own.
+type ProviderLister interface {
+	Names() []string
+	List() []providers.Info
+}
 
-// NewServer builds an MCPServer with one registered tool, run_query.
-// `version` is reflected in MCP server-info responses; pass something like
-// "spike" or a build SHA.
-func NewServer(version string, runner QueryRunner) *server.MCPServer {
-	s := server.NewMCPServer("intent-gateway", version,
+// NewServer builds an MCPServer with run_query and list_providers
+// registered. `version` flows into the MCP server-info handshake.
+func NewServer(version string, runner QueryRunner, lister ProviderLister) *server.MCPServer {
+	s := server.NewMCPServer("genie", version,
 		server.WithToolCapabilities(false),
 	)
-	s.AddTool(runQueryTool(), runQueryHandler(runner))
+	s.AddTool(runQueryTool(lister), runQueryHandler(runner, lister))
+	s.AddTool(listProvidersTool(), listProvidersHandler(lister))
 	return s
 }
 
-// runQueryTool defines the tool's metadata + JSON-Schema input. Kept as a
-// constructor for testability — the same shape is exposed to clients.
-func runQueryTool() mcp.Tool {
-	schema := map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"provider": map[string]any{
-				"type":        "string",
-				"description": fmt.Sprintf("Target system. Currently supported: %s.", strings.Join(SupportedProviders, ", ")),
-				"enum":        SupportedProviders,
-			},
-			"query": map[string]any{
-				"type":        "string",
-				"description": "A GraphQL-shaped query string. Field names may be invented — they are treated as intent signals, not schema references. Example: `{ pull_requests(owner: \"x\", repo: \"y\", state: \"open\") { title number author { login } } }`.",
-			},
+func runQueryTool(lister ProviderLister) mcp.Tool {
+	names := append([]string(nil), lister.Names()...)
+	sort.Strings(names)
+
+	properties := map[string]any{
+		"provider": map[string]any{
+			"type":        "string",
+			"description": fmt.Sprintf("Target provider. Configured: %s.", strings.Join(names, ", ")),
 		},
-		"required": []string{"provider", "query"},
+		"query": map[string]any{
+			"type":        "string",
+			"description": "A GraphQL-shaped query string. Field names may be invented — they are treated as intent signals, not schema references. Example: `{ pull_requests(owner: \"x\", repo: \"y\", state: \"open\") { title number author { login } } }`.",
+		},
+	}
+	if len(names) > 0 {
+		properties["provider"].(map[string]any)["enum"] = names
+	}
+
+	schema := map[string]any{
+		"type":       "object",
+		"properties": properties,
+		"required":   []string{"provider", "query"},
 	}
 	raw, _ := json.Marshal(schema)
 	return mcp.Tool{
-		Name:        "run_query",
-		Description: "Resolve a hallucinated GraphQL-shaped query against the target system. The first call for a given query shape pays an LLM-generation cost; subsequent calls hit the crystallized cache. Returns JSON whose top-level shape matches the requested field selection.",
+		Name:           "run_query",
+		Description:    "Resolve a GraphQL-shaped query against the named provider. The first call for a given query shape pays an LLM-generation cost; subsequent calls hit the crystallized cache. Returns JSON whose top-level shape matches the requested field selection.",
 		RawInputSchema: raw,
 	}
 }
 
-// runQueryHandler is the per-call handler. Validates `provider`, defers to
-// `runner`, and serialises the result as a single text block. Errors come
-// back as MCP tool-error results so the calling LLM can self-correct.
-func runQueryHandler(runner QueryRunner) server.ToolHandlerFunc {
+func runQueryHandler(runner QueryRunner, lister ProviderLister) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
@@ -71,10 +81,10 @@ func runQueryHandler(runner QueryRunner) server.ToolHandlerFunc {
 		if provider == "" {
 			return mcp.NewToolResultError("missing required arg: provider"), nil
 		}
-		if !providerSupported(provider) {
+		if !contains(lister.Names(), provider) {
 			return mcp.NewToolResultError(fmt.Sprintf(
-				"provider %q not supported; supported: %s",
-				provider, strings.Join(SupportedProviders, ", "),
+				"provider %q not configured; known: %s",
+				provider, strings.Join(lister.Names(), ", "),
 			)), nil
 		}
 
@@ -83,7 +93,7 @@ func runQueryHandler(runner QueryRunner) server.ToolHandlerFunc {
 			return mcp.NewToolResultError("missing required arg: query"), nil
 		}
 
-		result, err := runner(ctx, query)
+		result, err := runner(ctx, provider, query)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("resolution failed: %v", err)), nil
 		}
@@ -96,9 +106,32 @@ func runQueryHandler(runner QueryRunner) server.ToolHandlerFunc {
 	}
 }
 
-func providerSupported(p string) bool {
-	for _, s := range SupportedProviders {
-		if s == p {
+func listProvidersTool() mcp.Tool {
+	schema := map[string]any{
+		"type":       "object",
+		"properties": map[string]any{},
+	}
+	raw, _ := json.Marshal(schema)
+	return mcp.Tool{
+		Name:           "list_providers",
+		Description:    "List the providers (upstream MCP servers) that Genie is fronting. Returns name + description for each. Tool catalogues are intentionally not exposed — that would defeat the purpose of routing through Genie.",
+		RawInputSchema: raw,
+	}
+}
+
+func listProvidersHandler(lister ProviderLister) server.ToolHandlerFunc {
+	return func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		buf, err := json.MarshalIndent(lister.List(), "", "  ")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("encode result: %v", err)), nil
+		}
+		return mcp.NewToolResultText(string(buf)), nil
+	}
+}
+
+func contains(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
 			return true
 		}
 	}

@@ -69,7 +69,7 @@ func (n *Node) AliasOrName() string {
 // invented arguments pass through silently — that's the entire point of
 // the schemaless mode.
 func Parse(query string) (*Query, error) {
-	doc, err := parser.ParseQuery(&ast.Source{Name: "intent-gw", Input: query})
+	doc, err := parser.ParseQuery(&ast.Source{Name: "genie", Input: query})
 	if err != nil {
 		return nil, fmt.Errorf("parse: %w", err)
 	}

@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/mrdon/gqlspike/internal/runtime"
+	"github.com/sleuth-io/genie/internal/runtime"
 )
 
 // ScriptResolver returns the monty script source registered against a node
@@ -242,7 +242,7 @@ func (e *Executor) composeOne(
 		// For object children, descend into the canonical-keyed sub-object.
 		// For scalar leaves, the leaf branch in resolveNode handles the
 		// rename projection.
-		var childParent any = parent
+		var childParent = parent
 		if len(child.Selection) > 0 {
 			if pmap, ok := parent.(map[string]any); ok {
 				childParent = pmap[parentRename.canonicalChildName(child.Name)]

@@ -9,8 +9,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/mrdon/gqlspike/internal/engine"
-	"github.com/mrdon/gqlspike/internal/plan"
+	"github.com/sleuth-io/genie/internal/engine"
+	"github.com/sleuth-io/genie/internal/plan"
 )
 
 // AdversarialSet is the parsed eval/adversarial.yaml file.
@@ -74,7 +74,7 @@ func RunAdversarial(ctx context.Context, gen *plan.Generator, set *AdversarialSe
 	startAll := time.Now()
 
 	for _, p := range set.Pairs {
-		fmt.Fprintf(out, "→ %s …", p.ID)
+		_, _ = fmt.Fprintf(out, "→ %s …", p.ID)
 		res := runOnePair(ctx, gen, p)
 		results = append(results, res)
 
@@ -92,16 +92,16 @@ func RunAdversarial(ctx context.Context, gen *plan.Generator, set *AdversarialSe
 		}
 		if res.ErrA != nil || res.ErrB != nil {
 			summary.Errored++
-			fmt.Fprintf(out, " ERROR (a=%v b=%v) [%v]\n",
+			_, _ = fmt.Fprintf(out, " ERROR (a=%v b=%v) [%v]\n",
 				res.ErrA, res.ErrB, res.Duration.Round(time.Millisecond))
 			continue
 		}
 		if res.Pass {
 			summary.Pass++
-			fmt.Fprintf(out, " PASS [%s] (collided=%v expected=%s) [%v]\n",
+			_, _ = fmt.Fprintf(out, " PASS [%s] (collided=%v expected=%s) [%v]\n",
 				shortHash(res.HashA), res.Collided, p.Expect, res.Duration.Round(time.Millisecond))
 		} else {
-			fmt.Fprintf(out, " FAIL (collided=%v expected=%s) hashA=%s hashB=%s [%v]\n",
+			_, _ = fmt.Fprintf(out, " FAIL (collided=%v expected=%s) hashA=%s hashB=%s [%v]\n",
 				res.Collided, p.Expect, shortHash(res.HashA), shortHash(res.HashB),
 				res.Duration.Round(time.Millisecond))
 		}
@@ -112,16 +112,16 @@ func RunAdversarial(ctx context.Context, gen *plan.Generator, set *AdversarialSe
 		summary.FalsePositiveRate = float64(summary.FalsePositives) / float64(summary.ExpectDifferent)
 	}
 
-	fmt.Fprintf(out, "\n--- adversarial summary ---\n")
-	fmt.Fprintf(out, "  total:                %d\n", summary.Total)
-	fmt.Fprintf(out, "  expect different:     %d  (false-positive collisions: %d)\n",
+	_, _ = fmt.Fprintf(out, "\n--- adversarial summary ---\n")
+	_, _ = fmt.Fprintf(out, "  total:                %d\n", summary.Total)
+	_, _ = fmt.Fprintf(out, "  expect different:     %d  (false-positive collisions: %d)\n",
 		summary.ExpectDifferent, summary.FalsePositives)
-	fmt.Fprintf(out, "  expect same:          %d  (false-negative non-collisions: %d)\n",
+	_, _ = fmt.Fprintf(out, "  expect same:          %d  (false-negative non-collisions: %d)\n",
 		summary.ExpectSame, summary.FalseNegatives)
-	fmt.Fprintf(out, "  passed:               %d\n", summary.Pass)
-	fmt.Fprintf(out, "  errored:              %d\n", summary.Errored)
-	fmt.Fprintf(out, "  false-positive rate:  %.1f%% (target <5%%)\n", summary.FalsePositiveRate*100)
-	fmt.Fprintf(out, "  wall:                 %v\n", summary.Wall.Round(time.Millisecond))
+	_, _ = fmt.Fprintf(out, "  passed:               %d\n", summary.Pass)
+	_, _ = fmt.Fprintf(out, "  errored:              %d\n", summary.Errored)
+	_, _ = fmt.Fprintf(out, "  false-positive rate:  %.1f%% (target <5%%)\n", summary.FalsePositiveRate*100)
+	_, _ = fmt.Fprintf(out, "  wall:                 %v\n", summary.Wall.Round(time.Millisecond))
 
 	return summary, results, nil
 }

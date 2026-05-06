@@ -1,7 +1,7 @@
-// Package mcpclient wraps an MCP server (currently just github-mcp-server)
-// running as a stdio subprocess. The Client lists tools on connect and
-// dispatches CallTool requests; package bridge.go adapts the tool surface
-// into monty host functions.
+// Package mcpclient wraps an upstream MCP server running as a stdio
+// subprocess. The Client lists tools on connect and dispatches CallTool
+// requests; package bridge.go adapts the tool surface into monty host
+// functions.
 package mcpclient
 
 import (
@@ -15,61 +15,82 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-// GitHubBinary is the executable name we spawn. Hardcoded per spike plan.
-// Users install it however they like (`go install`, brew, docker via shim).
+// GitHubBinary is the executable name spawned by OpenGitHub. Users install
+// it however they like (`go install`, brew, docker via shim).
 const GitHubBinary = "github-mcp-server"
 
 // PATEnvVar is the env var the github-mcp-server expects.
 const PATEnvVar = "GITHUB_PERSONAL_ACCESS_TOKEN"
 
-// Client is a thin wrapper over mark3labs/mcp-go's stdio client. It owns the
-// subprocess; Close tears it down.
+// ProviderSpec describes how to spawn an upstream MCP server.
+//
+// Env values are set on the child process only; they do not pollute the
+// Genie process's environment. Two providers' env vars cannot clash and
+// tokens do not leak between subprocesses.
+type ProviderSpec struct {
+	Name    string
+	Command string
+	Args    []string
+	Env     map[string]string
+}
+
+// Client is a thin wrapper over mark3labs/mcp-go's stdio client. It owns
+// the subprocess; Close tears it down.
 type Client struct {
 	mcp   *mcpc.Client
 	tools []mcp.Tool
 }
 
-// OpenGitHub spawns `github-mcp-server stdio`, performs the MCP handshake,
-// and lists tools. The returned Client is ready for Call.
-//
-// Errors fall into three buckets, distinguished only in the message:
-//   - PAT missing — caller should set GITHUB_PERSONAL_ACCESS_TOKEN.
-//   - binary missing — caller should install github-mcp-server.
-//   - protocol/auth failure — surfaces upstream error verbatim.
-func OpenGitHub(ctx context.Context) (*Client, error) {
-	pat := os.Getenv(PATEnvVar)
-	if pat == "" {
-		return nil, fmt.Errorf("%s not set; export it before running (see .env.example)", PATEnvVar)
+// Open spawns the configured MCP server, performs the MCP handshake, and
+// lists tools. The returned Client is ready for Call.
+func Open(ctx context.Context, spec ProviderSpec) (*Client, error) {
+	if spec.Command == "" {
+		return nil, fmt.Errorf("provider %q: command is empty", spec.Name)
 	}
 
-	mc, err := mcpc.NewStdioMCPClient(GitHubBinary,
-		[]string{PATEnvVar + "=" + pat},
-		"stdio",
-	)
+	envPairs := make([]string, 0, len(spec.Env))
+	for k, v := range spec.Env {
+		envPairs = append(envPairs, k+"="+v)
+	}
+
+	mc, err := mcpc.NewStdioMCPClient(spec.Command, envPairs, spec.Args...)
 	if err != nil {
-		return nil, fmt.Errorf("spawn %s stdio: %w "+
-			"(install with `go install github.com/github/github-mcp-server@latest` or brew)",
-			GitHubBinary, err)
+		return nil, fmt.Errorf("provider %q: spawn %s: %w", spec.Name, spec.Command, err)
 	}
 
 	initReq := mcp.InitializeRequest{}
 	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initReq.Params.ClientInfo = mcp.Implementation{
-		Name:    "intent-gw",
-		Version: "spike",
+		Name:    "genie",
+		Version: "dev",
 	}
 	if _, err := mc.Initialize(ctx, initReq); err != nil {
 		_ = mc.Close()
-		return nil, fmt.Errorf("mcp initialize: %w", err)
+		return nil, fmt.Errorf("provider %q: mcp initialize: %w", spec.Name, err)
 	}
 
 	listed, err := mc.ListTools(ctx, mcp.ListToolsRequest{})
 	if err != nil {
 		_ = mc.Close()
-		return nil, fmt.Errorf("mcp list tools: %w", err)
+		return nil, fmt.Errorf("provider %q: mcp list tools: %w", spec.Name, err)
 	}
 
 	return &Client{mcp: mc, tools: listed.Tools}, nil
+}
+
+// OpenGitHub is a convenience wrapper that builds the default GitHub MCP
+// server ProviderSpec from the PAT in the environment.
+func OpenGitHub(ctx context.Context) (*Client, error) {
+	pat := os.Getenv(PATEnvVar)
+	if pat == "" {
+		return nil, fmt.Errorf("%s not set; export it before running (see .env.example)", PATEnvVar)
+	}
+	return Open(ctx, ProviderSpec{
+		Name:    "github",
+		Command: GitHubBinary,
+		Args:    []string{"stdio"},
+		Env:     map[string]string{PATEnvVar: pat},
+	})
 }
 
 // Close shuts the subprocess down.

@@ -194,13 +194,13 @@ func New() (*Runner, error) {
 
 	// Instantiate WASI (provides clock, random, fd_write for the WASM module).
 	if _, err := wasi_snapshot_preview1.Instantiate(ctx, r); err != nil {
-		r.Close(ctx)
+		_ = r.Close(ctx)
 		return nil, fmt.Errorf("monty: failed to instantiate WASI: %w", err)
 	}
 
 	compiled, err := r.CompileModule(ctx, montyWasm)
 	if err != nil {
-		r.Close(ctx)
+		_ = r.Close(ctx)
 		return nil, fmt.Errorf("monty: failed to compile WASM module: %w", err)
 	}
 
@@ -224,7 +224,7 @@ func (r *Runner) Execute(ctx context.Context, code string, inputs map[string]any
 	if err != nil {
 		return nil, fmt.Errorf("monty: failed to instantiate module: %w", err)
 	}
-	defer mod.Close(ctx)
+	defer func() { _ = mod.Close(ctx) }()
 
 	inst := &instance{mod: mod}
 	if err := inst.resolveExports(); err != nil {

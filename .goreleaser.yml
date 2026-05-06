@@ -1,0 +1,63 @@
+version: 2
+project_name: genie
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: genie
+    main: ./cmd/genie
+    binary: genie
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/sleuth-io/genie/internal/buildinfo.Version={{.Version}}
+      - -X github.com/sleuth-io/genie/internal/buildinfo.Commit={{.Commit}}
+      - -X github.com/sleuth-io/genie/internal/buildinfo.Date={{.Date}}
+
+archives:
+  - id: genie
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+
+checksum:
+  name_template: 'checksums.txt'
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: sleuth-io
+    name: genie
+  draft: false
+  prerelease: auto
+  name_template: "{{.ProjectName}} v{{.Version}}"

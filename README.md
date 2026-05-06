@@ -15,15 +15,34 @@ Measured against the GitHub MCP server on a representative query:
 | Wall time | 18.7 s | 8.9 s | **−53%** |
 | LLM tokens on cache replay | full | **0** | — |
 
-See `docs/spike-writeup.md` for the full eval (16 curated queries, 14 adversarial pairs) and `docs/genie-as-a-tool.md` for the product framing.
 
 ## 30 seconds: add Genie to your agent
 
 ```bash
-go install github.com/mrdon/genie/cmd/genie@latest
+go install github.com/sleuth-io/genie/cmd/genie@latest
 ```
 
-In your agent's `.mcp.json` (or equivalent MCP-server config):
+Drop a config at `~/.config/genie/config.json` listing the upstream MCP servers Genie should front. Same shape as Claude Code's `.mcp.json` — paste yours in nearly verbatim:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "github-mcp-server",
+      "args": ["stdio"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${env:GITHUB_TOKEN}" },
+      "description": "GitHub repos, PRs, issues"
+    },
+    "linear": {
+      "command": "linear-mcp",
+      "args": ["--mode", "stdio"],
+      "env": { "LINEAR_API_KEY": "${env:LINEAR_API_KEY}" }
+    }
+  }
+}
+```
+
+Then point your agent at Genie:
 
 ```json
 {
@@ -32,20 +51,14 @@ In your agent's `.mcp.json` (or equivalent MCP-server config):
       "command": "genie",
       "args": ["serve"],
       "env": {
-        "GENIE_ENV_FILE": "/abs/path/to/your/.env"
+        "ANTHROPIC_API_KEY": "${env:ANTHROPIC_API_KEY}"
       }
     }
   }
 }
 ```
 
-Your agent's LLM now sees one new tool: `run_query(provider, query)`. Point it at a target API (today: `github`; multi-provider next) by adding the credentials to that `.env`:
-
-```bash
-GITHUB_PERSONAL_ACCESS_TOKEN=ghp_xxx
-ANTHROPIC_API_KEY=sk-ant-xxx
-go install github.com/github/github-mcp-server/cmd/github-mcp-server@latest
-```
+Your agent's LLM now sees two tools: `run_query(provider, query)` for resolution and `list_providers()` for introspection. The `provider` arg is one of the keys you put in `mcpServers` (above: `github`, `linear`).
 
 **What your agent's LLM does:** writes a GraphQL-shaped query string and passes it to `run_query`. The field names don't have to match any real schema — they're treated as intent signals. So either of these is valid input:
 
@@ -62,7 +75,7 @@ Both resolve to the same cached plan. The first call for a new query shape pays 
 
 ## What it does
 
-- **One tool, not dozens.** Your agent's LLM sees `run_query`, not the underlying MCP server's full tool catalog. No more "load 38 schemas to call one of them."
+- **Front many MCP servers, expose two tools.** Configure as many upstream MCP servers as you want; your agent's LLM still only sees `run_query` and `list_providers`. No more "load 38 schemas to call one of them."
 - **Pre-shaped responses.** Genie returns only the fields your agent asked for. Raw API responses (often 1.5K+ tokens of metadata) never enter your agent's context.
 - **Plan caching, not response caching.** The *resolution plan* is cached by canonical intent — the data stays fresh, the planning cost amortises. Paraphrases of the same question hit the same cached plan.
 - **Hallucination-tolerant input.** Your agent can ask in any GraphQL-shaped phrasing, including invented field names — Genie maps them to the real underlying fields. *Make a wish, get the data.*
@@ -71,18 +84,18 @@ Both resolve to the same cached plan. The first call for a new query shape pays 
 
 ### Mode 1 — sidecar / MCP server (recommended; works today)
 
-What the quickstart above describes. Your agent spawns `genie serve` as a subprocess, sees one MCP tool. Local cache lives in `./crystallized/`.
+What the quickstart above describes. Your agent spawns `genie serve` as a subprocess, sees `run_query` + `list_providers`. Cache lives at `~/.cache/genie/crystallized/` (or `$GENIE_CACHE_DIR`), shared across projects so paraphrased queries from any working directory hit the same plans.
 
 ### Mode 2 — Go library (in-process)
 
 ```go
-import "github.com/mrdon/genie/pkg/genie"
+import "github.com/sleuth-io/genie/pkg/genie"
 
-g, err := genie.New(genie.Config{
+g, err := genie.New(ctx, genie.Config{
     Providers:    []genie.Provider{genie.GitHubMCP(token)},
     AnthropicKey: os.Getenv("ANTHROPIC_API_KEY"),
-    CacheDir:     "./crystallized",
 })
+defer g.Close()
 
 result, err := g.Query(ctx, genie.QueryRequest{
     Provider: "github",
@@ -90,7 +103,7 @@ result, err := g.Query(ctx, genie.QueryRequest{
 })
 ```
 
-For Go agent frameworks that want tighter integration without a subprocess. Coming next.
+For Go agent frameworks that want tighter integration without a subprocess. Pass `Providers` programmatically (as above) or set `ConfigPath` to point at a JSON file in the same shape as the quickstart config.
 
 ### Mode 3 — CLI (debugging, scripting, eval)
 
@@ -101,32 +114,47 @@ genie eval --cold --replay     # run the bundled eval set
 
 ## Subcommands
 
-- `genie query "<graphql>"` — resolve one query, print JSON.
-- `genie serve` — start MCP stdio server exposing `run_query(provider, query)`.
+- `genie query [--provider NAME] "<graphql>"` — resolve one query, print JSON.
+- `genie serve` — start MCP stdio server exposing `run_query` + `list_providers`.
 - `genie eval [--cold] [--replay] [--hypothesis-3]` — run the curated and adversarial sets, print metrics.
+
+## Configuration
+
+- Config: `$GENIE_CONFIG` or `~/.config/genie/config.json` (per `os.UserConfigDir`).
+- Cache: `$GENIE_CACHE_DIR` or `~/.cache/genie/crystallized/` (per `os.UserCacheDir`). Each provider gets its own subdirectory.
+- Env vars in config use `${env:VAR}` interpolation. Unset variables are a hard error so a typo can't silently spawn an MCP server with an empty token.
+
+## LLM backend
+
+Plan generation needs an LLM. Genie picks a backend automatically:
+
+1. `ANTHROPIC_API_KEY` set → call the Anthropic API directly.
+2. Otherwise, if the `claude` CLI is on `PATH` → shell out to it. Useful when Genie is running under Claude Code; no API key required.
+3. Otherwise → error.
+
+Pin a specific backend with `GENIE_LLM_BACKEND=anthropic-sdk` or `GENIE_LLM_BACKEND=claude-cli`.
 
 ## Layout
 
-- `cmd/genie/` — entry points (`query`, `serve`, `eval`, …)
+- `cmd/genie/` — entry points (`query`, `serve`, `eval`)
+- `pkg/genie/` — public Go API (`New`, `Config`, `Query`, `ListProviders`, …)
+- `internal/config/` — config-file parser (`mcpServers` schema + env interpolation)
+- `internal/providers/` — multi-provider lifecycle (spawn, route, close)
 - `internal/runtime/` — embedded monty (Python-on-WASM via wazero); script execution sandbox
 - `internal/engine/` — schemaless GraphQL parser, node-shape hashing, executor
 - `internal/plan/` — Anthropic SDK calls for plan generation + canonical-shape normalisation
-- `internal/crystallize/` — flat-JSON cache under `./crystallized/` (L1 alias + L2 entry)
+- `internal/crystallize/` — flat-JSON cache (L1 alias + L2 entry, namespaced per provider)
 - `internal/mcpclient/` — MCP stdio client + bridge from script-side host functions to MCP tool calls
-- `internal/mcpserver/` — exposes the `run_query` tool to upstream agents
+- `internal/mcpserver/` — exposes `run_query` + `list_providers` to upstream agents
 - `internal/eval/` — eval harness + ground-truth fixtures + FR-7 metrics
 - `eval/intents.yaml`, `eval/adversarial.yaml` — curated test sets
 
 ## Status
 
-Working spike with measured wins on a curated GitHub eval set. **Not production-grade** — single-tenant, no governance layer, GitHub-only out of the box. Multi-provider (Linear, Notion, generic MCP) and the Go-library import path (`pkg/genie`) are next.
+Working spike with measured wins on a curated GitHub eval set. **Not production-grade** — single-tenant, no governance layer. Multi-provider routing works today; failed provider spawns are logged and dropped, not fatal. Lazy provider spawn, health checks, and OAuth-flow handoffs are deferred.
 
 ## Why this and not Portkey / LiteLLM / GPTCache
 
 Existing LLM gateways cache *responses* by semantic similarity — the data goes stale, and false-positive cache collisions are a known failure mode (0.8–99% in published research). Genie caches the *resolution plan* — the plan replays against fresh data on every call. Different category, different failure modes.
 
 Existing MCP gateways (Cloudflare AI Gateway, etc.) route and observe MCP traffic but don't shape responses or cache by intent. Genie sits one layer up — between your agent's LLM and the MCP servers it would otherwise hammer directly.
-
-## Origin
-
-Started as a 2-week spike validating three hypotheses (resolution feasibility, replay correctness, paraphrase fingerprinting). All three passed on real data. See `docs/intent-gateway-spike-prd.md` for the original PRD, `docs/spike-writeup.md` for the GO/KILL writeup, and `docs/genie-as-a-tool.md` for the post-spike product framing.

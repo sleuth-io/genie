@@ -15,7 +15,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/mrdon/gqlspike/internal/runtime"
+	"github.com/sleuth-io/genie/internal/runtime"
 )
 
 // BuildClockBuiltins returns the (BuiltIns, BuiltInParams) pair to merge

@@ -6,8 +6,8 @@ import (
 	"io"
 	"time"
 
-	"github.com/mrdon/gqlspike/internal/engine"
-	"github.com/mrdon/gqlspike/internal/plan"
+	"github.com/sleuth-io/genie/internal/engine"
+	"github.com/sleuth-io/genie/internal/plan"
 )
 
 // Runner wires the harness to the live executor. The Run* methods are the
@@ -101,7 +101,7 @@ func (r *Runner) runAll(ctx context.Context, cases []Case, label string) ([]Case
 	startAll := time.Now()
 
 	for _, c := range cases {
-		fmt.Fprintf(r.Out, "→ %s/%s …", c.IntentID, c.Variant)
+		_, _ = fmt.Fprintf(r.Out, "→ %s/%s …", c.IntentID, c.Variant)
 		res := r.runOne(ctx, c)
 		results = append(results, res)
 		summary.TotalTokens += res.LLMTokens
@@ -118,15 +118,15 @@ func (r *Runner) runAll(ctx context.Context, cases []Case, label string) ([]Case
 		case res.Err != nil:
 			summary.Errored++
 			summary.Failed++
-			fmt.Fprintf(r.Out, " ERROR [%s tok=%d] (%s) [%v]\n",
+			_, _ = fmt.Fprintf(r.Out, " ERROR [%s tok=%d] (%s) [%v]\n",
 				res.Status, res.LLMTokens, res.Err, res.Duration.Round(time.Millisecond))
 		case res.AssertErr != nil:
 			summary.Failed++
-			fmt.Fprintf(r.Out, " FAIL  [%s tok=%d] (%s) [%v]\n",
+			_, _ = fmt.Fprintf(r.Out, " FAIL  [%s tok=%d] (%s) [%v]\n",
 				res.Status, res.LLMTokens, res.AssertErr, res.Duration.Round(time.Millisecond))
 		default:
 			summary.Passed++
-			fmt.Fprintf(r.Out, " PASS  [%s tok=%d] [%v]\n",
+			_, _ = fmt.Fprintf(r.Out, " PASS  [%s tok=%d] [%v]\n",
 				res.Status, res.LLMTokens, res.Duration.Round(time.Millisecond))
 		}
 	}
@@ -189,18 +189,18 @@ func classify(before, after plan.Metrics) (CacheStatus, int64) {
 }
 
 func (r *Runner) printSummary(label string, s Summary) {
-	fmt.Fprintf(r.Out, "\n--- %s summary ---\n", label)
-	fmt.Fprintf(r.Out, "  total:    %d\n", s.Total)
-	fmt.Fprintf(r.Out, "  passed:   %d\n", s.Passed)
-	fmt.Fprintf(r.Out, "  failed:   %d (incl. %d errored)\n", s.Failed, s.Errored)
-	fmt.Fprintf(r.Out, "  rate:     %.1f%%\n", s.PassRate()*100)
-	fmt.Fprintf(r.Out, "  L1 hits:  %d   L2 hits: %d   generated: %d\n",
+	_, _ = fmt.Fprintf(r.Out, "\n--- %s summary ---\n", label)
+	_, _ = fmt.Fprintf(r.Out, "  total:    %d\n", s.Total)
+	_, _ = fmt.Fprintf(r.Out, "  passed:   %d\n", s.Passed)
+	_, _ = fmt.Fprintf(r.Out, "  failed:   %d (incl. %d errored)\n", s.Failed, s.Errored)
+	_, _ = fmt.Fprintf(r.Out, "  rate:     %.1f%%\n", s.PassRate()*100)
+	_, _ = fmt.Fprintf(r.Out, "  L1 hits:  %d   L2 hits: %d   generated: %d\n",
 		s.L1Hits, s.L2Hits, s.Generated)
 	avg := float64(0)
 	if s.Total > 0 {
 		avg = float64(s.TotalTokens) / float64(s.Total)
 	}
-	fmt.Fprintf(r.Out, "  tokens:   total=%d  avg/case=%.0f\n", s.TotalTokens, avg)
-	fmt.Fprintf(r.Out, "  wall:     %v\n", s.Wall.Round(time.Millisecond))
+	_, _ = fmt.Fprintf(r.Out, "  tokens:   total=%d  avg/case=%.0f\n", s.TotalTokens, avg)
+	_, _ = fmt.Fprintf(r.Out, "  wall:     %v\n", s.Wall.Round(time.Millisecond))
 }
 

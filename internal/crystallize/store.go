@@ -25,7 +25,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/mrdon/gqlspike/internal/engine"
+	"github.com/sleuth-io/genie/internal/engine"
 )
 
 // Entry is the canonical-keyed record. One per unique canonical_schema.
