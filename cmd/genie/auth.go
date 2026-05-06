@@ -44,7 +44,7 @@ func loadProviderConfig(configPath, name string) (config.ProviderConfig, error) 
 	if err != nil {
 		return config.ProviderConfig{}, err
 	}
-	cfg, err := config.Load(path)
+	cfg, err := config.LoadForEdit(path)
 	if err != nil {
 		return config.ProviderConfig{}, err
 	}
@@ -97,11 +97,15 @@ func authList(configPath string) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := config.Load(path)
+	cfg, err := config.LoadForEdit(path)
 	if err != nil {
 		return err
 	}
 	vault := auth.Open()
+	if len(cfg.MCPServers) == 0 {
+		fmt.Printf("No providers configured. Add one with `genie mcp add <name> <url|command>`.\n")
+		return nil
+	}
 
 	names := make([]string, 0, len(cfg.MCPServers))
 	for n := range cfg.MCPServers {

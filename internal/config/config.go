@@ -160,6 +160,53 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// LoadForEdit reads the config without expanding ${env:VAR} references
+// or validating providers. Use this when you intend to mutate and save
+// the config back (genie mcp add/remove); Load is destructive in that
+// context because it inlines env-var values.
+//
+// Returns an empty Config (zero entries under mcpServers) if the file
+// does not exist, so callers can treat "first edit" identically to
+// "subsequent edit".
+func LoadForEdit(path string) (*Config, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &Config{MCPServers: map[string]ProviderConfig{}}, nil
+		}
+		return nil, fmt.Errorf("read config %q: %w", path, err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return nil, fmt.Errorf("parse config %q: %w", path, err)
+	}
+	if cfg.MCPServers == nil {
+		cfg.MCPServers = map[string]ProviderConfig{}
+	}
+	return &cfg, nil
+}
+
+// Save writes the config to path with stable indentation. Directory
+// is created (0700) if missing; file is written 0600 because it can
+// hold tokens in env values. Atomic via tempfile + rename.
+func Save(path string, cfg *Config) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
+	}
+	buf, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode config: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, append(buf, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("rename %s -> %s: %w", tmp, path, err)
+	}
+	return nil
+}
+
 var envRefPattern = regexp.MustCompile(`\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 // expandEnvMap rewrites ${env:VAR} references in each value against the

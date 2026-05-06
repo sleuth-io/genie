@@ -46,6 +46,8 @@ func main() {
 		err = runEval(ctx, args)
 	case "auth":
 		err = runAuth(ctx, args)
+	case "mcp":
+		err = runMCP(ctx, args)
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -86,12 +88,15 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `genie — smart MCP client for agents
 
 Usage:
+  genie mcp add <name> <url|command> [args...]
+                            add a provider to your config (HTTP runs auth)
+  genie mcp list            list configured providers
+  genie mcp remove <name>   drop a provider
+  genie auth <provider>     re-run the OAuth flow for an http/sse provider
+  genie auth list           show auth status for each provider
   genie query "<graphql>"   resolve one query, print JSON
   genie serve               start MCP server (run_query, list_providers)
   genie eval                run curated eval set
-  genie auth <provider>     authorize an http/sse provider (browser flow)
-  genie auth list           show auth status for each configured provider
-  genie auth logout <p>     drop stored credentials for one provider
 
 Required env (set directly or via .env):
   GITHUB_PERSONAL_ACCESS_TOKEN  GitHub PAT, forwarded to github-mcp-server

@@ -22,32 +22,27 @@ Measured against the GitHub MCP server on a representative query:
 go install github.com/sleuth-io/genie/cmd/genie@latest
 ```
 
-Drop a config at `~/.config/genie/config.json` listing the upstream MCP servers Genie should front. Same shape as Claude Code's `.mcp.json` — paste yours in nearly verbatim:
+Add the MCP servers you want Genie to front. No config file to edit — `genie mcp add` writes it for you:
 
-```json
-{
-  "mcpServers": {
-    "github": {
-      "command": "github-mcp-server",
-      "args": ["stdio"],
-      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${env:GITHUB_TOKEN}" },
-      "description": "GitHub repos, PRs, issues"
-    },
-    "linear": {
-      "url": "https://mcp.linear.app/sse",
-      "type": "sse",
-      "scopes": ["read", "write"],
-      "description": "Linear issues + projects"
-    },
-    "atlassian": {
-      "url": "https://mcp.atlassian.com/v1",
-      "description": "Jira + Confluence"
-    }
-  }
-}
+```bash
+# A stdio MCP server (env-var auth)
+genie mcp add github github-mcp-server stdio \
+  --env 'GITHUB_PERSONAL_ACCESS_TOKEN=${env:GITHUB_TOKEN}' \
+  --description 'GitHub repos, PRs, issues'
+
+# An HTTP/SSE MCP server with OAuth — Genie pops a browser, finishes the
+# RFC 8414 + RFC 7591 dance, stores tokens in your OS keychain.
+genie mcp add linear https://mcp.linear.app/sse --type sse --scope read --scope write
+
+# Anything you can paste from Claude Code's .mcp.json works verbatim:
+genie mcp add --json '{"name":"atlassian","url":"https://mcp.atlassian.com/v1"}'
+
+# Inspect what's wired up:
+genie mcp list
+genie auth list
 ```
 
-For HTTP/SSE servers that require OAuth, the first run pops a browser to authorize. Tokens land in your OS keychain (Keychain on macOS, Secret Service on Linux, Credential Manager on Windows); refresh is automatic. To re-authorize manually, run `genie auth <provider>`.
+Tokens land in your OS keychain (Keychain on macOS, Secret Service on Linux, Credential Manager on Windows); refresh is automatic. To re-authorize manually, run `genie auth <provider>`. The config itself lives at `~/.config/genie/config.json` if you ever want to edit it directly — it's the same JSON shape Claude Code uses, so you can paste yours in.
 
 Then point your agent at Genie:
 
@@ -121,12 +116,24 @@ genie eval --cold --replay     # run the bundled eval set
 
 ## Subcommands
 
-- `genie query [--provider NAME] "<graphql>"` — resolve one query, print JSON.
-- `genie serve` — start MCP stdio server exposing `run_query` + `list_providers`.
-- `genie eval [--cold] [--replay] [--hypothesis-3]` — run the curated and adversarial sets, print metrics.
-- `genie auth <provider>` — authorize an OAuth-protected HTTP/SSE provider in your browser.
-- `genie auth list` — show auth status (which providers are authenticated, when their tokens expire).
+Provider management:
+
+- `genie mcp add <name> <url|command> [args...]` — register an MCP server. URL → http/sse transport (auto-runs OAuth flow); command → stdio.
+- `genie mcp add --json '{...}'` — same, fed an entry from Claude Code's `.mcp.json` verbatim.
+- `genie mcp list` — show configured providers.
+- `genie mcp remove <name>` — drop a provider (also clears its stored credentials unless `--keep-credentials`).
+
+Auth:
+
+- `genie auth <provider>` — re-run the OAuth browser flow for an http/sse provider.
+- `genie auth list` — show which providers are authenticated and when tokens expire.
 - `genie auth logout <provider>` — drop stored credentials for one provider.
+
+Runtime:
+
+- `genie serve` — start MCP stdio server exposing `run_query` + `list_providers`.
+- `genie query [--provider NAME] "<graphql>"` — resolve one query, print JSON.
+- `genie eval [--cold] [--replay] [--hypothesis-3]` — run the curated and adversarial sets, print metrics.
 
 ## Authentication
 
