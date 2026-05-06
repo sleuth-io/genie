@@ -34,14 +34,45 @@ import (
 // equivalent to passing --config <path>.
 const PathEnvVar = "GENIE_CONFIG"
 
-// ProviderConfig is one entry under mcpServers — how to spawn an upstream
-// MCP server. Description is Genie-specific (used by list_providers); all
-// other fields mirror Claude Code's .mcp.json format.
+// ProviderConfig is one entry under mcpServers — how Genie reaches an
+// upstream MCP server. Two transport shapes:
+//
+//   - stdio:    Command + Args + Env (subprocess piping stdio)
+//   - http/sse: URL + optional Type + optional Scopes + optional Headers
+//
+// Type defaults to "http" when URL is set; pass "sse" to force the SSE
+// transport. Scopes is the OAuth scope list to request when the server
+// requires authorization. Headers are static request headers (e.g. for
+// pre-issued API keys); not used for OAuth, the OAuth handler inserts
+// the Authorization header itself.
+//
+// Description is Genie-specific (surfaced by list_providers).
 type ProviderConfig struct {
-	Command     string            `json:"command"`
+	Command     string            `json:"command,omitempty"`
 	Args        []string          `json:"args,omitempty"`
 	Env         map[string]string `json:"env,omitempty"`
+	URL         string            `json:"url,omitempty"`
+	Type        string            `json:"type,omitempty"`
+	Scopes      []string          `json:"scopes,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
 	Description string            `json:"description,omitempty"`
+}
+
+// IsHTTP reports whether the provider uses an HTTP-style transport
+// (http or sse).
+func (p ProviderConfig) IsHTTP() bool {
+	return p.URL != ""
+}
+
+// TransportType returns the resolved transport: "stdio", "http", or "sse".
+func (p ProviderConfig) TransportType() string {
+	if p.URL == "" {
+		return "stdio"
+	}
+	if p.Type == "sse" {
+		return "sse"
+	}
+	return "http"
 }
 
 // Config is the parsed config file.
@@ -99,8 +130,16 @@ func Load(path string) (*Config, error) {
 	}
 
 	for name, prov := range cfg.MCPServers {
-		if strings.TrimSpace(prov.Command) == "" {
-			return nil, fmt.Errorf("config %q: provider %q: command is required", path, name)
+		hasCmd := strings.TrimSpace(prov.Command) != ""
+		hasURL := strings.TrimSpace(prov.URL) != ""
+		switch {
+		case hasCmd && hasURL:
+			return nil, fmt.Errorf("config %q: provider %q: set either command or url, not both", path, name)
+		case !hasCmd && !hasURL:
+			return nil, fmt.Errorf("config %q: provider %q: one of command or url is required", path, name)
+		}
+		if prov.Type != "" && prov.Type != "stdio" && prov.Type != "http" && prov.Type != "sse" {
+			return nil, fmt.Errorf("config %q: provider %q: type %q not recognised (want stdio|http|sse)", path, name, prov.Type)
 		}
 		if prov.Env != nil {
 			expanded, err := expandEnvMap(prov.Env, name)
@@ -108,8 +147,15 @@ func Load(path string) (*Config, error) {
 				return nil, fmt.Errorf("config %q: %w", path, err)
 			}
 			prov.Env = expanded
-			cfg.MCPServers[name] = prov
 		}
+		if prov.Headers != nil {
+			expanded, err := expandEnvMap(prov.Headers, name)
+			if err != nil {
+				return nil, fmt.Errorf("config %q: %w", path, err)
+			}
+			prov.Headers = expanded
+		}
+		cfg.MCPServers[name] = prov
 	}
 	return &cfg, nil
 }

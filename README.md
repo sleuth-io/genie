@@ -34,13 +34,20 @@ Drop a config at `~/.config/genie/config.json` listing the upstream MCP servers 
       "description": "GitHub repos, PRs, issues"
     },
     "linear": {
-      "command": "linear-mcp",
-      "args": ["--mode", "stdio"],
-      "env": { "LINEAR_API_KEY": "${env:LINEAR_API_KEY}" }
+      "url": "https://mcp.linear.app/sse",
+      "type": "sse",
+      "scopes": ["read", "write"],
+      "description": "Linear issues + projects"
+    },
+    "atlassian": {
+      "url": "https://mcp.atlassian.com/v1",
+      "description": "Jira + Confluence"
     }
   }
 }
 ```
+
+For HTTP/SSE servers that require OAuth, the first run pops a browser to authorize. Tokens land in your OS keychain (Keychain on macOS, Secret Service on Linux, Credential Manager on Windows); refresh is automatic. To re-authorize manually, run `genie auth <provider>`.
 
 Then point your agent at Genie:
 
@@ -117,6 +124,15 @@ genie eval --cold --replay     # run the bundled eval set
 - `genie query [--provider NAME] "<graphql>"` — resolve one query, print JSON.
 - `genie serve` — start MCP stdio server exposing `run_query` + `list_providers`.
 - `genie eval [--cold] [--replay] [--hypothesis-3]` — run the curated and adversarial sets, print metrics.
+- `genie auth <provider>` — authorize an OAuth-protected HTTP/SSE provider in your browser.
+- `genie auth list` — show auth status (which providers are authenticated, when their tokens expire).
+- `genie auth logout <provider>` — drop stored credentials for one provider.
+
+## Authentication
+
+Genie supports stdio MCP servers (env-var auth, e.g. `GITHUB_PERSONAL_ACCESS_TOKEN`) and HTTP/SSE servers with OAuth 2.1 + PKCE. The OAuth flow uses RFC 8414 + RFC 9728 well-known discovery and RFC 7591 dynamic client registration, so no per-provider client setup is needed for compliant servers.
+
+Tokens are stored in the OS keychain by default (override with `GENIE_AUTH_BACKEND=file` for headless boxes without a keyring). Refresh tokens are used automatically when access tokens expire; on refresh failure or token revocation, the next request re-runs the browser flow.
 
 ## Configuration
 
@@ -139,6 +155,7 @@ Pin a specific backend with `GENIE_LLM_BACKEND=anthropic-sdk` or `GENIE_LLM_BACK
 - `cmd/genie/` — entry points (`query`, `serve`, `eval`)
 - `pkg/genie/` — public Go API (`New`, `Config`, `Query`, `ListProviders`, …)
 - `internal/config/` — config-file parser (`mcpServers` schema + env interpolation)
+- `internal/auth/` — OAuth flow + keychain/file-backed token vault
 - `internal/providers/` — multi-provider lifecycle (spawn, route, close)
 - `internal/runtime/` — embedded monty (Python-on-WASM via wazero); script execution sandbox
 - `internal/engine/` — schemaless GraphQL parser, node-shape hashing, executor

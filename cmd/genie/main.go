@@ -44,6 +44,8 @@ func main() {
 		err = runServe(ctx, args)
 	case "eval":
 		err = runEval(ctx, args)
+	case "auth":
+		err = runAuth(ctx, args)
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -87,6 +89,9 @@ Usage:
   genie query "<graphql>"   resolve one query, print JSON
   genie serve               start MCP server (run_query, list_providers)
   genie eval                run curated eval set
+  genie auth <provider>     authorize an http/sse provider (browser flow)
+  genie auth list           show auth status for each configured provider
+  genie auth logout <p>     drop stored credentials for one provider
 
 Required env (set directly or via .env):
   GITHUB_PERSONAL_ACCESS_TOKEN  GitHub PAT, forwarded to github-mcp-server

@@ -1,18 +1,29 @@
 // Package providers owns the lifecycle of upstream MCP server
-// subprocesses. A Registry is built once at startup from the parsed
-// config; it spawns each provider eagerly and keeps the resulting
-// mcpclient.Client around for the duration of the Genie process. A
-// failed provider is logged and dropped, not fatal — so a misconfigured
-// Linear server cannot prevent GitHub from working.
+// connections — both stdio subprocesses and HTTP/SSE remotes. A
+// Registry is built once at startup from the parsed config; it
+// connects to each provider eagerly and keeps the resulting
+// mcpclient.Client around for the duration of the Genie process.
+//
+// A failed provider is logged and dropped, not fatal — so a
+// misconfigured Linear server cannot prevent GitHub from working.
+//
+// HTTP providers may require OAuth. The first connect that
+// receives an OAuthAuthorizationRequiredError triggers an
+// interactive auth flow (browser + local callback); on success the
+// retry succeeds. Tokens are persisted via auth.Vault so subsequent
+// process starts skip the flow until the token expires (refresh is
+// automatic via mcp-go) or is revoked.
 package providers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
 	"sync"
 
+	"github.com/sleuth-io/genie/internal/auth"
 	"github.com/sleuth-io/genie/internal/config"
 	"github.com/sleuth-io/genie/internal/mcpclient"
 )
@@ -30,35 +41,36 @@ type Registry struct {
 	mu      sync.RWMutex
 	clients map[string]*mcpclient.Client
 	info    map[string]Info
+	vault   auth.Vault
+	cfg     *config.Config
 }
 
-// NewRegistry spawns one MCP client per configured provider and returns
-// a Registry containing the successful ones. Failed spawns are logged
-// at warn level; they do not abort startup. The returned Registry is
-// empty (and an error) only if every provider failed.
+// NewRegistry connects to one MCP server per configured provider and
+// returns a Registry containing the successful ones. Failed connects
+// are logged at warn level; they do not abort startup. The returned
+// Registry is empty (and an error) only if every provider failed.
 func NewRegistry(ctx context.Context, cfg *config.Config) (*Registry, error) {
 	r := &Registry{
 		clients: make(map[string]*mcpclient.Client, len(cfg.MCPServers)),
 		info:    make(map[string]Info, len(cfg.MCPServers)),
+		vault:   auth.Open(),
+		cfg:     cfg,
 	}
 
 	var failures []string
 	for name, prov := range cfg.MCPServers {
-		spec := mcpclient.ProviderSpec{
-			Name:    name,
-			Command: prov.Command,
-			Args:    prov.Args,
-			Env:     prov.Env,
-		}
-		c, err := mcpclient.Open(ctx, spec)
+		c, err := r.connect(ctx, name, prov)
 		if err != nil {
-			slog.Warn("provider spawn failed; skipping", "provider", name, "err", err)
+			slog.Warn("provider connect failed; skipping", "provider", name, "err", err)
 			failures = append(failures, fmt.Sprintf("%s: %v", name, err))
 			continue
 		}
 		r.clients[name] = c
 		r.info[name] = Info{Name: name, Description: prov.Description}
-		slog.Info("provider ready", "provider", name, "tools", len(c.Tools()))
+		slog.Info("provider ready",
+			"provider", name,
+			"transport", prov.TransportType(),
+			"tools", len(c.Tools()))
 	}
 
 	if len(r.clients) == 0 {
@@ -66,6 +78,60 @@ func NewRegistry(ctx context.Context, cfg *config.Config) (*Registry, error) {
 			len(cfg.MCPServers), failures)
 	}
 	return r, nil
+}
+
+// connect builds the mcpclient.ProviderSpec for a configured server,
+// runs the OAuth flow if the first connect requires authorization,
+// and returns the live client.
+func (r *Registry) connect(ctx context.Context, name string, prov config.ProviderConfig) (*mcpclient.Client, error) {
+	spec := r.buildSpec(name, prov)
+	c, err := mcpclient.Open(ctx, spec)
+	if err == nil {
+		return c, nil
+	}
+	var oauthErr *mcpclient.OAuthRequiredError
+	if !errors.As(err, &oauthErr) {
+		return nil, err
+	}
+
+	slog.Info("provider needs authorization; running OAuth flow", "provider", name)
+	if err := auth.Run(ctx, auth.FlowConfig{
+		ProviderName: name,
+		ServerURL:    prov.URL,
+		Scopes:       prov.Scopes,
+		Vault:        r.vault,
+	}); err != nil {
+		return nil, fmt.Errorf("oauth flow: %w", err)
+	}
+
+	// Reload state so the retry picks up the freshly-registered
+	// client_id + token.
+	spec = r.buildSpec(name, prov)
+	return mcpclient.Open(ctx, spec)
+}
+
+// buildSpec assembles a ProviderSpec from config + persisted auth
+// state. Stdio providers ignore all OAuth fields.
+func (r *Registry) buildSpec(name string, prov config.ProviderConfig) mcpclient.ProviderSpec {
+	spec := mcpclient.ProviderSpec{
+		Name:    name,
+		Command: prov.Command,
+		Args:    prov.Args,
+		Env:     prov.Env,
+		URL:     prov.URL,
+		Type:    prov.TransportType(),
+		Scopes:  prov.Scopes,
+		Headers: prov.Headers,
+	}
+	if prov.IsHTTP() {
+		spec.OAuthTokenStore = auth.NewTokenStore(r.vault, name)
+		if state, err := r.vault.Load(name); err == nil {
+			spec.OAuthClientID = state.ClientID
+			spec.OAuthClientSecret = state.ClientSecret
+			spec.OAuthRedirectURI = state.RedirectURI
+		}
+	}
+	return spec
 }
 
 // Get returns the live MCP client for a provider name, or false if no
