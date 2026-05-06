@@ -1,0 +1,141 @@
+# Adversarial fingerprint set for hypothesis 3.
+#
+# Each pair is two queries that LOOK similar — same surface vocabulary, same
+# top-level field — but mean different things, and so MUST land in different
+# canonical-cache entries. A false positive is when expect=different yields
+# identical canonical hashes (collision); a false negative is when
+# expect=same yields different hashes (over-fragmentation).
+#
+# Hypothesis-3 success: false-positive collision rate <5% on the
+# expect=different subset.
+
+pairs:
+  # ---- expect: different (the load-bearing test) ----
+
+  - id: prs-by-author-vs-reviewer
+    description: PRs authored by X vs PRs awaiting X's review — different roles.
+    a: '{ pull_requests(author: "alice", state: "open") { title number } }'
+    b: '{ pull_requests(reviewer: "alice", state: "open") { title number } }'
+    expect: different
+
+  - id: pr-title-vs-body
+    description: PR title vs body — both strings, totally different content.
+    a: '{ pull_requests(owner: "x", repo: "y", state: "open") { title } }'
+    b: '{ pull_requests(owner: "x", repo: "y", state: "open") { body } }'
+    expect: different
+
+  - id: pr-mergeable-vs-merged
+    description: Mergeable status (can it merge) vs merged status (was it merged).
+    a: '{ pull_requests(owner: "x", repo: "y") { number mergeable } }'
+    b: '{ pull_requests(owner: "x", repo: "y") { number merged } }'
+    expect: different
+
+  - id: pr-time-to-first-review-vs-merge
+    description: Time to first review (how fast reviewers responded) vs time to merge (how long until landed).
+    a: '{ pull_requests(owner: "x", repo: "y", state: "merged") { number timeToFirstReview } }'
+    b: '{ pull_requests(owner: "x", repo: "y", state: "merged") { number timeToMerge } }'
+    expect: different
+
+  - id: issues-open-vs-closed
+    description: |
+      Same arg name (state), different value. The cached script reads
+      args["state"] at runtime — a single canonical entry handles both.
+      Reclassified: this pair MUST collide.
+    a: '{ issues(owner: "x", repo: "y", state: "open") { title number } }'
+    b: '{ issues(owner: "x", repo: "y", state: "closed") { title number } }'
+    expect: same
+
+  - id: commits-by-author-vs-committer
+    description: GitHub distinguishes author (wrote) and committer (applied). Different facets.
+    a: '{ commits(owner: "x", repo: "y", author: "alice") { sha message } }'
+    b: '{ commits(owner: "x", repo: "y", committer: "alice") { sha message } }'
+    expect: different
+
+  - id: repo-stars-vs-forks
+    description: Star count vs fork count — both popularity, different mechanics.
+    a: '{ repository(owner: "x", repo: "y") { name stargazers_count } }'
+    b: '{ repository(owner: "x", repo: "y") { name forks_count } }'
+    expect: different
+
+  - id: search-repos-vs-issues
+    description: Searching repos vs searching issues — same search verb, different entity.
+    a: '{ search_repositories(query: "graphql") { name description } }'
+    b: '{ search_issues(query: "graphql") { title number } }'
+    expect: different
+
+  - id: pr-reviewers-vs-assignees
+    description: Reviewers (gate the merge) vs assignees (own the work).
+    a: '{ pull_requests(owner: "x", repo: "y", state: "open") { number reviewers { login } } }'
+    b: '{ pull_requests(owner: "x", repo: "y", state: "open") { number assignees { login } } }'
+    expect: different
+
+  - id: user-followers-vs-following
+    description: Who follows X vs whom X follows — opposite direction.
+    a: '{ user(login: "alice") { followers { login } } }'
+    b: '{ user(login: "alice") { following { login } } }'
+    expect: different
+
+  - id: branch-default-vs-named
+    description: |
+      One omits the branch arg; the script handles both cases (default branch
+      when arg is absent, named branch when present). Same script, same canonical.
+      Reclassified: this pair MUST collide.
+    a: '{ commits(owner: "x", repo: "y") { sha message } }'
+    b: '{ commits(owner: "x", repo: "y", branch: "feature/foo") { sha message } }'
+    expect: same
+
+  - id: issue-labels-vs-milestone
+    description: Filter by label vs filter by milestone.
+    a: '{ issues(owner: "x", repo: "y", labels: "bug") { title number } }'
+    b: '{ issues(owner: "x", repo: "y", milestone: "v2") { title number } }'
+    expect: different
+
+  - id: pr-files-changed-vs-comments
+    description: Files changed in a PR vs comments on a PR — both nested lists.
+    a: '{ pull_requests(owner: "x", repo: "y", state: "open") { number files { path } } }'
+    b: '{ pull_requests(owner: "x", repo: "y", state: "open") { number comments { body } } }'
+    expect: different
+
+  - id: repo-issues-count-vs-prs-count
+    description: Issue count vs PR count — both numeric metrics on a repo.
+    a: '{ repository(owner: "x", repo: "y") { name open_issues_count } }'
+    b: '{ repository(owner: "x", repo: "y") { name open_pull_requests_count } }'
+    expect: different
+
+  - id: tag-vs-release
+    description: Git tags vs GitHub releases — overlapping but distinct.
+    a: '{ tags(owner: "x", repo: "y") { name sha } }'
+    b: '{ releases(owner: "x", repo: "y") { name tag_name } }'
+    expect: different
+
+  - id: pr-base-vs-head
+    description: Base branch (target) vs head branch (source) of a PR.
+    a: '{ pull_requests(owner: "x", repo: "y", state: "open") { number base { ref } } }'
+    b: '{ pull_requests(owner: "x", repo: "y", state: "open") { number head { ref } } }'
+    expect: different
+
+  # ---- expect: same (control — these MUST collide) ----
+
+  - id: control-prs-paraphrase
+    description: Two paraphrases of "open PRs in repo" — must collide.
+    a: '{ pull_requests(owner: "x", repo: "y", state: "open") { title number } }'
+    b: '{ openPRs(owner: "x", repo: "y") { title number } }'
+    expect: same
+
+  - id: control-issues-paraphrase
+    description: Two paraphrases of "open issues in repo" — must collide.
+    a: '{ issues(owner: "x", repo: "y", state: "open") { title number } }'
+    b: '{ openIssues(owner: "x", repo: "y") { title number } }'
+    expect: same
+
+  - id: control-author-paraphrase
+    description: author { login } and author { username } should collide on author{login}.
+    a: '{ pull_requests(owner: "x", repo: "y") { author { login } } }'
+    b: '{ pull_requests(owner: "x", repo: "y") { author { username } } }'
+    expect: same
+
+  - id: control-viewer-paraphrase
+    description: All "the authenticated user" paraphrases collide.
+    a: '{ viewer { login } }'
+    b: '{ me { login } }'
+    expect: same

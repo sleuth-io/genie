@@ -1,0 +1,114 @@
+# Curated eval set for the intent-gateway spike.
+#
+# Each `intent` is one user goal. `query` is the canonical phrasing; each
+# entry under `paraphrases` is a different surface form of the same goal.
+# `assertions` declare the minimal shape a correct response must satisfy:
+#   - list_paths:  paths whose value must be a list (and non-empty)
+#   - nonempty_paths:  paths whose value must be present and non-null
+#   - nonempty_paths_in_each: for list_paths, fields that must be present
+#       and non-null in every element of the list
+#
+# Hypothesis-1 evaluation runs every query (canonical + every paraphrase)
+# once against a cold cache and counts pass-rate against assertions.
+# Hypothesis-2/3 evaluation reuses the same set in subsequent days.
+
+intents:
+  - id: viewer
+    description: Authenticated user's login.
+    query: '{ viewer { login } }'
+    assertions:
+      nonempty_paths: [viewer.login]
+    paraphrases:
+      - query: '{ me { login } }'
+        assertions:
+          nonempty_paths: [me.login]
+      - query: '{ currentUser { username } }'
+        assertions:
+          nonempty_paths: [currentUser.username]
+
+  - id: open-prs-basic
+    description: Open PRs in a repo with title and number.
+    query: '{ pull_requests(owner: "anthropics", repo: "anthropic-sdk-python", state: "open") { title number } }'
+    assertions:
+      list_paths: [pull_requests]
+      nonempty_paths_in_each:
+        pull_requests: [title, number]
+    paraphrases:
+      - query: '{ openPRs(owner: "anthropics", repo: "anthropic-sdk-python") { title number } }'
+        assertions:
+          list_paths: [openPRs]
+          nonempty_paths_in_each:
+            openPRs: [title, number]
+      - query: '{ pullRequests(owner: "anthropics", repo: "anthropic-sdk-python", state: "open") { name id } }'
+        assertions:
+          list_paths: [pullRequests]
+          nonempty_paths_in_each:
+            pullRequests: [name, id]
+
+  - id: open-prs-author
+    description: Open PRs with nested author selection.
+    query: '{ pull_requests(owner: "anthropics", repo: "anthropic-sdk-python", state: "open") { title number author { login } } }'
+    assertions:
+      list_paths: [pull_requests]
+      nonempty_paths_in_each:
+        pull_requests: [title, number, author.login]
+    paraphrases:
+      - query: '{ openPRs(owner: "anthropics", repo: "anthropic-sdk-python") { title number author { login } } }'
+        assertions:
+          list_paths: [openPRs]
+          nonempty_paths_in_each:
+            openPRs: [title, number, author.login]
+
+  - id: open-issues
+    description: Open issues in a repo.
+    query: '{ issues(owner: "modelcontextprotocol", repo: "servers", state: "open") { title number } }'
+    assertions:
+      list_paths: [issues]
+      nonempty_paths_in_each:
+        issues: [title, number]
+    paraphrases:
+      - query: '{ openIssues(owner: "modelcontextprotocol", repo: "servers") { title number } }'
+        assertions:
+          list_paths: [openIssues]
+          nonempty_paths_in_each:
+            openIssues: [title, number]
+
+  - id: recent-commits
+    description: Recent commits on the default branch.
+    query: '{ commits(owner: "anthropics", repo: "anthropic-sdk-python") { sha message } }'
+    assertions:
+      list_paths: [commits]
+      nonempty_paths_in_each:
+        commits: [sha, message]
+    paraphrases:
+      - query: '{ recent_commits(owner: "anthropics", repo: "anthropic-sdk-python") { hash message } }'
+        assertions:
+          list_paths: [recent_commits]
+          nonempty_paths_in_each:
+            recent_commits: [hash, message]
+
+  - id: repo-info
+    description: Single repository's basic metadata.
+    query: '{ repository(owner: "anthropics", repo: "anthropic-sdk-python") { name description stars } }'
+    assertions:
+      nonempty_paths:
+        - repository.name
+    paraphrases:
+      - query: '{ repo(owner: "anthropics", name: "anthropic-sdk-python") { name description star_count } }'
+        assertions:
+          nonempty_paths:
+            - repo.name
+
+  - id: hallucinated-pr-fields
+    description: PR list with field names not present in the GitHub schema.
+    query: '{ pull_requests(owner: "anthropics", repo: "anthropic-sdk-python", state: "open") { title timeOpen } }'
+    assertions:
+      list_paths: [pull_requests]
+      nonempty_paths_in_each:
+        pull_requests: [title]
+    paraphrases:
+      - query: '{ pull_requests(owner: "anthropics", repo: "anthropic-sdk-python", state: "open") { title days_open } }'
+        assertions:
+          list_paths: [pull_requests]
+          nonempty_paths_in_each:
+            pull_requests: [title]

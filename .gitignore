@@ -1,0 +1,100 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Project binary in root
+/skills
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Go workspace file
+go.work
+
+# Build artifacts
+/dist/
+/build/
+/bin/
+
+# Dependency directories
+/vendor/
+
+# Override the `MANIFEST` rule from common global gitignores so our
+# internal/manifest package isn't silently skipped on case-insensitive
+# filesystems (macOS/Windows).
+!internal/manifest/
+!internal/manifest/*
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# GoReleaser
+.goreleaser.yml.bak
+dist/
+
+# Test coverage
+*.coverprofile
+coverage.txt
+coverage.html
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Log files
+*.log
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# OS generated files
+Thumbs.db
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+
+# Local configuration (if any test configs are created)
+config.local.json
+
+# Debug files
+debug
+__debug_bin
+
+# Air live reload (if using dev mode)
+.air.toml
+tmp/
+
+pulse-client
+demo
+.claude
+
+.cursor
+pulse
+
+.github/skills
+.github/hooks
+.github/copilot-instructions.md
+
+.gemini
+
+.agents
+AGENTS.md
+
+.cline
+.kiro
+.mcp.json

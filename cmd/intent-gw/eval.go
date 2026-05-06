@@ -1,0 +1,153 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"os"
+
+	"github.com/mrdon/gqlspike/internal/eval"
+)
+
+// runEval executes the curated set in eval/intents.yaml. Two phases:
+//
+//   Phase 1 (always): wipe ./crystallized if --cold, then run all cases.
+//                     This is the "first call" measurement (hypothesis 1).
+//   Phase 2 (--replay): run all cases AGAIN against the now-warm cache.
+//                       This is the replay measurement (hypothesis 2).
+//
+// Flags:
+//   --intents PATH       override eval/intents.yaml
+//   --adversarial PATH   override eval/adversarial.yaml
+//   --crystallized DIR   override ./crystallized
+//   --cold               wipe the crystallize dir before phase 1
+//   --replay             run a second pass against the warm cache (H2)
+//   --hypothesis-3       skip H1/H2; just run the adversarial pair set (H3)
+func runEval(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("eval", flag.ContinueOnError)
+	intentsPath := fs.String("intents", "eval/intents.yaml", "path to intents YAML")
+	advPath := fs.String("adversarial", "eval/adversarial.yaml", "path to adversarial YAML")
+	dir := fs.String("crystallized", "./crystallized", "crystallized cache directory")
+	cold := fs.Bool("cold", false, "wipe crystallized dir before running (cold cache)")
+	replay := fs.Bool("replay", false, "after the first run, run again against the warm cache")
+	h3 := fs.Bool("hypothesis-3", false, "run only the adversarial fingerprint set (H3)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *h3 {
+		return runHypothesis3(ctx, *advPath, *dir)
+	}
+
+	set, err := eval.Load(*intentsPath)
+	if err != nil {
+		return err
+	}
+
+	if *cold {
+		if err := os.RemoveAll(*dir); err != nil {
+			return fmt.Errorf("wipe %s: %w", *dir, err)
+		}
+		fmt.Fprintf(os.Stderr, "wiped %s for cold-cache run\n", *dir)
+	}
+
+	bundle, err := setupEngine(ctx, *dir)
+	if err != nil {
+		return err
+	}
+	defer bundle.Close()
+
+	r := &eval.Runner{
+		Set:       set,
+		Executor:  bundle.executor,
+		Generator: bundle.generator,
+		Out:       os.Stdout,
+	}
+	_, firstSummary, err := r.RunFirstCall(ctx)
+	if err != nil {
+		return err
+	}
+
+	if !*replay {
+		if firstSummary.PassRate() < 0.80 {
+			os.Exit(2)
+		}
+		return nil
+	}
+
+	fmt.Fprintln(os.Stdout)
+	fmt.Fprintln(os.Stdout, "=== second pass (replay against warm cache) ===")
+	_, replaySummary, err := r.RunReplay(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Hypothesis 2 verdict: ≥95% pass AND ≥10× token reduction (avg/case).
+	firstAvg := safeAvg(firstSummary.TotalTokens, firstSummary.Total)
+	replayAvg := safeAvg(replaySummary.TotalTokens, replaySummary.Total)
+	reduction := float64(0)
+	if replayAvg > 0 {
+		reduction = firstAvg / replayAvg
+	} else if firstAvg > 0 {
+		reduction = float64(1<<30) // effectively infinite
+	}
+
+	fmt.Fprintln(os.Stdout)
+	fmt.Fprintln(os.Stdout, "=== hypothesis verdicts ===")
+	fmt.Fprintf(os.Stdout, "  H1 (≥80%% first-call):       %s (%.1f%%)\n",
+		passFail(firstSummary.PassRate() >= 0.80), firstSummary.PassRate()*100)
+	fmt.Fprintf(os.Stdout, "  H2 (≥95%% replay correctness): %s (%.1f%%)\n",
+		passFail(replaySummary.PassRate() >= 0.95), replaySummary.PassRate()*100)
+	fmt.Fprintf(os.Stdout, "  H2 (≥10× token reduction):   %s (%.1fx, %.0f → %.0f tokens/case)\n",
+		passFail(reduction >= 10), reduction, firstAvg, replayAvg)
+
+	if firstSummary.PassRate() < 0.80 || replaySummary.PassRate() < 0.95 || reduction < 10 {
+		os.Exit(2)
+	}
+	return nil
+}
+
+func safeAvg(total int64, n int) float64 {
+	if n == 0 {
+		return 0
+	}
+	return float64(total) / float64(n)
+}
+
+func passFail(ok bool) string {
+	if ok {
+		return "PASS"
+	}
+	return "FAIL"
+}
+
+// runHypothesis3 runs the adversarial fingerprint set. Each pair is two
+// queries that should canonicalise to either the same hash (paraphrase
+// control) or different hashes (the load-bearing case). Pass = false-
+// positive rate <5% on the expect=different pairs.
+func runHypothesis3(ctx context.Context, advPath, dir string) error {
+	set, err := eval.LoadAdversarial(advPath)
+	if err != nil {
+		return err
+	}
+
+	bundle, err := setupEngine(ctx, dir)
+	if err != nil {
+		return err
+	}
+	defer bundle.Close()
+
+	summary, _, err := eval.RunAdversarial(ctx, bundle.generator, set, os.Stdout)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintln(os.Stdout)
+	fmt.Fprintln(os.Stdout, "=== hypothesis verdict ===")
+	fmt.Fprintf(os.Stdout, "  H3 (<5%% false-positive collisions): %s (%.1f%%)\n",
+		passFail(summary.FalsePositiveRate < 0.05), summary.FalsePositiveRate*100)
+	if summary.FalsePositiveRate >= 0.05 {
+		os.Exit(2)
+	}
+	return nil
+}
