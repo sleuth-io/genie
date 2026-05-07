@@ -21,10 +21,10 @@ type Set struct {
 
 // Intent is one user goal with a canonical query and a slate of paraphrases.
 type Intent struct {
-	ID          string      `yaml:"id"`
-	Description string      `yaml:"description"`
-	Query       string      `yaml:"query"`
-	Assertions  Assertions  `yaml:"assertions"`
+	ID          string       `yaml:"id"`
+	Description string       `yaml:"description"`
+	Query       string       `yaml:"query"`
+	Assertions  Assertions   `yaml:"assertions"`
 	Paraphrases []Paraphrase `yaml:"paraphrases,omitempty"`
 }
 

@@ -2,15 +2,15 @@
 // providers. It owns three things:
 //
 //   - persistence of access + refresh tokens (Vault interface, with
-//     a keyring-backed implementation and a file-backed fallback)
+//     a keyring-backed implementation and a file-backed fallback);
 //   - persistence of dynamic-client-registration metadata (client_id,
 //     redirect_uri) alongside the token, so we don't re-register on
-//     every restart
-//   - the interactive flow that obtains a fresh token (browser open
-//     + local callback listener)
+//     every restart;
+//   - the interactive flow that obtains a fresh token (opens the
+//     browser, listens on a local callback URL, exchanges the code).
 //
-// Use Open(provider) to get a Vault for one provider, then construct
-// a Store from it to plug into mcp-go's transport.OAuthConfig.
+// Use Open() to get a Vault, then construct a Store from it to plug
+// into mcp-go's transport.OAuthConfig.
 package auth
 
 import (

@@ -20,7 +20,7 @@ import (
 // (Day 6 / L2) in that field names are *not* normalised: `pull_requests`
 // and `pullRequests` produce different L1 hashes.
 type Shape struct {
-	Field    string  `json:"field"`
+	Field    string   `json:"field"`
 	ArgNames []string `json:"args"`
 	Children []Shape  `json:"selection"`
 }

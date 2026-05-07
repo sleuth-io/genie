@@ -155,4 +155,3 @@ Literal shape (as written by the user):
 
 Now produce the JSON response.`, buf), nil
 }
-

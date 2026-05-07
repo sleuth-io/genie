@@ -55,15 +55,15 @@ type PairResult struct {
 
 // AdversarialSummary aggregates the run.
 type AdversarialSummary struct {
-	Total                 int
-	ExpectDifferent       int
-	ExpectSame            int
-	FalsePositives        int // expect=different but collided
-	FalseNegatives        int // expect=same   but did not collide
-	Pass                  int
-	Errored               int
-	Wall                  time.Duration
-	FalsePositiveRate     float64 // FP / ExpectDifferent
+	Total             int
+	ExpectDifferent   int
+	ExpectSame        int
+	FalsePositives    int // expect=different but collided
+	FalseNegatives    int // expect=same   but did not collide
+	Pass              int
+	Errored           int
+	Wall              time.Duration
+	FalsePositiveRate float64 // FP / ExpectDifferent
 }
 
 // RunAdversarial normalizes both queries in each pair and reports collision

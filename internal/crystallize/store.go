@@ -30,13 +30,13 @@ import (
 
 // Entry is the canonical-keyed record. One per unique canonical_schema.
 type Entry struct {
-	Shape            engine.Shape    `json:"shape"`
-	Field            string          `json:"field"`
-	CanonicalSchema  json.RawMessage `json:"canonical_schema,omitempty"`
-	CanonicalHash    string          `json:"canonical_hash"`
-	MontyScript      string          `json:"monty_script"`
-	IOSchema         any             `json:"io_schema,omitempty"`
-	CreatedAt        time.Time       `json:"created_at"`
+	Shape           engine.Shape    `json:"shape"`
+	Field           string          `json:"field"`
+	CanonicalSchema json.RawMessage `json:"canonical_schema,omitempty"`
+	CanonicalHash   string          `json:"canonical_hash"`
+	MontyScript     string          `json:"monty_script"`
+	IOSchema        any             `json:"io_schema,omitempty"`
+	CreatedAt       time.Time       `json:"created_at"`
 }
 
 // Alias is the literal-shape-keyed pointer record. Multiple aliases can

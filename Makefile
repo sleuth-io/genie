@@ -1,4 +1,4 @@
-.PHONY: help build build-darwin build-darwin-amd64 install test eval lint format clean release run dev deps tidy verify update-deps init prepush postpull
+.PHONY: help build build-darwin build-darwin-amd64 install test eval lint vet check-format format ci clean release run dev deps tidy verify update-deps init prepush postpull
 
 # Default target
 help: ## Show this help message
@@ -42,9 +42,11 @@ install: build ## Install binary to ~/.local/bin
 		   echo "  export PATH=\"\$$PATH:\$$HOME/.local/bin\"" ;; \
 	esac
 
+TEST_PKGS=./internal/config/... ./internal/engine/... ./internal/llm/... ./pkg/...
+
 test: ## Run unit tests (no external API calls)
 	@echo "Running tests..."
-	@OUTPUT=$$(go test -race -cover ./internal/config/... ./internal/engine/... ./internal/llm/... ./pkg/... 2>&1 | grep -v 'no such tool "covdata"'); \
+	@OUTPUT=$$(go test -race -cover $(TEST_PKGS) 2>&1 | grep -v 'no such tool "covdata"'); \
 	if echo "$$OUTPUT" | grep -q "^FAIL"; then \
 		echo "$$OUTPUT"; \
 		exit 1; \
@@ -56,14 +58,30 @@ test: ## Run unit tests (no external API calls)
 eval: build ## Run the curated eval set (requires ANTHROPIC_API_KEY + GITHUB_PERSONAL_ACCESS_TOKEN)
 	@$(BUILD_DIR)/$(BINARY_NAME) eval --cold --replay
 
-lint: ## Run linters
+lint: ## Run golangci-lint
 	@echo "Running linters..."
 	@go tool golangci-lint run
 
-format: ## Format code
+vet: ## go vet ./...
+	@echo "Running go vet..."
+	@go vet ./...
+
+check-format: ## Verify gofmt compliance — fails if any file needs formatting
+	@OUT=$$(gofmt -l .); \
+	if [ -n "$$OUT" ]; then \
+		echo "Files need gofmt:"; \
+		echo "$$OUT"; \
+		echo ""; \
+		echo "Run 'make format' to fix."; \
+		exit 1; \
+	fi
+
+format: ## Auto-format code (gofmt -w + go mod tidy)
 	@echo "Formatting code..."
-	@gofmt -s -w .
+	@gofmt -w .
 	@go mod tidy
+
+ci: check-format lint vet test build ## Run the same checks CI runs (no auto-fix)
 
 clean: ## Clean build artifacts
 	@echo "Cleaning..."
@@ -111,6 +129,6 @@ init: ## Initialize development environment (download deps)
 	@echo ""
 	@echo "✓ Development environment initialized"
 
-prepush: format lint test build ## Run before pushing (format, lint, test, build)
+prepush: format ci ## Run before pushing — auto-format, then run the CI checks
 
 postpull: init ## Run after pulling (download dependencies)

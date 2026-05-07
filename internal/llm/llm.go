@@ -33,10 +33,10 @@ type SystemBlock struct {
 // only what Claude Code surfaces in its stream-json result event;
 // fields it doesn't surface stay zero.
 type Usage struct {
-	InputTokens          int64
-	OutputTokens         int64
-	CacheCreationTokens  int64
-	CacheReadTokens      int64
+	InputTokens         int64
+	OutputTokens        int64
+	CacheCreationTokens int64
+	CacheReadTokens     int64
 }
 
 // Response is what Generate returns: the assembled text plus best-

@@ -24,10 +24,10 @@ type Runner struct {
 type CacheStatus int
 
 const (
-	StatusUnknown CacheStatus = iota
-	StatusL1Hit              // verbatim re-run; no LLM call
-	StatusL2Hit              // paraphrase; one normalize call, no full generate
-	StatusGenerated          // full generate; both normalize + generate calls
+	StatusUnknown   CacheStatus = iota
+	StatusL1Hit                 // verbatim re-run; no LLM call
+	StatusL2Hit                 // paraphrase; one normalize call, no full generate
+	StatusGenerated             // full generate; both normalize + generate calls
 )
 
 func (s CacheStatus) String() string {
@@ -55,15 +55,15 @@ type CaseResult struct {
 
 // Summary aggregates per-run metrics for the GO/KILL/REDESIGN call.
 type Summary struct {
-	Total      int
-	Passed     int
-	Failed     int
-	Errored    int // execution-time errors (parse, run, MCP, LLM)
-	L1Hits     int
-	L2Hits     int
-	Generated  int
+	Total       int
+	Passed      int
+	Failed      int
+	Errored     int // execution-time errors (parse, run, MCP, LLM)
+	L1Hits      int
+	L2Hits      int
+	Generated   int
 	TotalTokens int64
-	Wall       time.Duration // total wall-clock for the run
+	Wall        time.Duration // total wall-clock for the run
 }
 
 // PassRate is Passed / Total (as a fraction). 0 when Total == 0.
@@ -203,4 +203,3 @@ func (r *Runner) printSummary(label string, s Summary) {
 	_, _ = fmt.Fprintf(r.Out, "  tokens:   total=%d  avg/case=%.0f\n", s.TotalTokens, avg)
 	_, _ = fmt.Fprintf(r.Out, "  wall:     %v\n", s.Wall.Round(time.Millisecond))
 }
-

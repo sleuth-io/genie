@@ -37,11 +37,11 @@ import (
 //
 // Generate orchestrates two distinct LLM calls on a cache miss:
 //
-//   1. NORMALIZE — small call, produces a canonical schema JSON.
-//      Hash it; look up the L2 entry. If present, done — saves the
-//      generate call entirely (the load-bearing hypothesis-2 win).
-//   2. GENERATE — big call, produces the monty script + io_schema.
-//      Only fires if L2 is also a miss.
+//  1. NORMALIZE — small call, produces a canonical schema JSON.
+//     Hash it; look up the L2 entry. If present, done — saves the
+//     generate call entirely (the load-bearing hypothesis-2 win).
+//  2. GENERATE — big call, produces the monty script + io_schema.
+//     Only fires if L2 is also a miss.
 type Generator struct {
 	client          llm.Client
 	store           *crystallize.Store
@@ -58,13 +58,13 @@ type Generator struct {
 // Cumulative across the lifetime of the Generator — eval harness snapshots
 // before/after each case to derive per-case deltas.
 type Metrics struct {
-	NormalizeCalls          int
-	GenerateCalls           int
-	NormalizeInputTokens    int64
-	NormalizeOutputTokens   int64
-	GenerateInputTokens     int64
-	GenerateOutputTokens    int64
-	CacheReadInputTokens    int64
+	NormalizeCalls           int
+	GenerateCalls            int
+	NormalizeInputTokens     int64
+	NormalizeOutputTokens    int64
+	GenerateInputTokens      int64
+	GenerateOutputTokens     int64
+	CacheReadInputTokens     int64
 	CacheCreationInputTokens int64
 }
 
@@ -518,9 +518,9 @@ Respond with a single JSON object — no prose, no markdown fence:
       }
     }
 
-`+"`arg_rename`"+` covers ONLY the args at THIS top-level node. `+"`field_rename`"+` covers ONLY the direct children of THIS node (not deeper levels — children are normalised on their own descent). Both maps are required even if every entry is identity (literal == canonical) — emit identity entries explicitly.
+` + "`arg_rename`" + ` covers ONLY the args at THIS top-level node. ` + "`field_rename`" + ` covers ONLY the direct children of THIS node (not deeper levels — children are normalised on their own descent). Both maps are required even if every entry is identity (literal == canonical) — emit identity entries explicitly.
 
-Worked example for input `+"`{ openPRs(name: \"sdk\") { title num }`"+`:
+Worked example for input ` + "`{ openPRs(name: \"sdk\") { title num }`" + `:
 
     {
       "canonical_schema": {
@@ -608,4 +608,3 @@ Parent context (already canonical-keyed; receive it as `+"`parent`"+`):
 
 Now produce the JSON response.`, shapeJSON, canonJSON, parentBlock), nil
 }
-
