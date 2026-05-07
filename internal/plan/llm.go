@@ -138,7 +138,7 @@ func (g *Generator) callLLM(ctx context.Context, callType, field string, system 
 			CacheReadTokens:     resp.Usage.CacheReadTokens,
 		}
 	}
-	g.session.Append(rec)
+	g.session.AppendCtx(ctx, rec)
 	return resp, err
 }
 
@@ -174,9 +174,17 @@ func (g *Generator) Generate(ctx context.Context, n *engine.Node, parent any) (s
 	// to translate this literal's args/fields around it.
 	if alias, ok, _ := g.store.GetAlias(literalHash); ok {
 		if entry, ok, _ := g.store.GetEntry(alias.CanonicalHash); ok {
+			g.session.AppendCtx(ctx, session.Record{
+				Call: "cache_l1", Provider: g.provider, Field: n.Name,
+				Hit: true, Hash: literalHash[:12],
+			})
 			return entry.MontyScript, alias.Rename, nil
 		}
 	}
+	g.session.AppendCtx(ctx, session.Record{
+		Call: "cache_l1", Provider: g.provider, Field: n.Name,
+		Hit: false, Hash: literalHash[:12],
+	})
 
 	// Step 2: normalize.
 	canonical, canonicalHash, rename, canonSchema, err := g.normalizeNode(ctx, n)
@@ -191,11 +199,19 @@ func (g *Generator) Generate(ctx context.Context, n *engine.Node, parent any) (s
 			"literal_hash", literalHash[:12],
 			"canonical_hash", canonicalHash[:12],
 		)
+		g.session.AppendCtx(ctx, session.Record{
+			Call: "cache_l2", Provider: g.provider, Field: n.Name,
+			Hit: true, Hash: canonicalHash[:12],
+		})
 		if err := g.store.PutAlias(literalHash, canonicalHash, rename); err != nil {
 			slog.Warn("plan: L1 alias write failed", "err", err)
 		}
 		return script, rename, nil
 	}
+	g.session.AppendCtx(ctx, session.Record{
+		Call: "cache_l2", Provider: g.provider, Field: n.Name,
+		Hit: false, Hash: canonicalHash[:12],
+	})
 
 	// Step 4: full generate. Pass the canonical schema so the LLM emits a
 	// canonical-keyed script (other paraphrases reusing this script via L2

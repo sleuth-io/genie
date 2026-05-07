@@ -265,12 +265,41 @@ func (g *Genie) Query(ctx context.Context, req QueryRequest) (*Result, error) {
 		return nil, fmt.Errorf("unknown provider %q (known: %v)", req.Provider, g.registry.Names())
 	}
 
+	// Tag every record produced during this Query with one
+	// query_id so a session reader can group cache events, LLM
+	// calls, and tool calls back to a single user request.
+	queryID := session.NewQueryID()
+	ctx = session.WithSession(ctx, g.session)
+	ctx = session.WithQueryID(ctx, queryID)
+
+	g.session.AppendCtx(ctx, session.Record{
+		Call:     "query",
+		Provider: req.Provider,
+		Query:    req.Query,
+	})
+	start := time.Now()
+
 	parsed, err := engine.Parse(req.Query)
 	if err != nil {
+		g.session.AppendCtx(ctx, session.Record{
+			Call:       "query_end",
+			Provider:   req.Provider,
+			Err:        err.Error(),
+			DurationMS: time.Since(start).Milliseconds(),
+		})
 		return nil, fmt.Errorf("parse: %w", err)
 	}
 
 	out, err := bundle.executor.Execute(ctx, parsed)
+	end := session.Record{
+		Call:       "query_end",
+		Provider:   req.Provider,
+		DurationMS: time.Since(start).Milliseconds(),
+	}
+	if err != nil {
+		end.Err = err.Error()
+	}
+	g.session.AppendCtx(ctx, end)
 	if err != nil {
 		return nil, err
 	}
@@ -354,6 +383,9 @@ func (g *Genie) Close() error {
 
 func buildProviderBundle(name string, client *mcpclient.Client, monty *runtime.MontyEngine, llmClient llm.Client, cacheRoot string, sess *session.Session) *providerBundle {
 	mcpFuncs, mcpParams := mcpclient.BuildHostFunctions(client)
+	for fname, inner := range mcpFuncs {
+		mcpFuncs[fname] = wrapToolFunc(name, fname, inner)
+	}
 	clockFuncs, clockParams := sandbox.BuildClockBuiltins()
 	builtIns, params := sandbox.MergeBuiltins(
 		struct {

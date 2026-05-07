@@ -15,6 +15,7 @@
 package session
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -25,25 +26,97 @@ import (
 	"github.com/google/uuid"
 )
 
+// Context plumbing so the recording happens at every layer
+// (pkg/genie, plan, host-function wrapper) without threading the
+// session pointer through every signature.
+type sessionKey struct{}
+type queryIDKey struct{}
+
+// WithSession attaches sess to ctx. Subsequent FromContext calls in
+// the same goroutine tree return it.
+func WithSession(ctx context.Context, sess *Session) context.Context {
+	return context.WithValue(ctx, sessionKey{}, sess)
+}
+
+// FromContext returns the Session attached to ctx, or a no-op
+// Session if none. Always returns a non-nil value so callers can
+// always Append without nil-checks.
+func FromContext(ctx context.Context) *Session {
+	if v, ok := ctx.Value(sessionKey{}).(*Session); ok && v != nil {
+		return v
+	}
+	return noopSession
+}
+
+// WithQueryID attaches a query-scoped UUID to ctx so events from
+// the same Query call group together in the JSONL.
+func WithQueryID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, queryIDKey{}, id)
+}
+
+// QueryIDFromContext returns the attached query ID, or "".
+func QueryIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(queryIDKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// NewQueryID returns a fresh UUID suitable for WithQueryID.
+func NewQueryID() string {
+	return uuid.NewString()
+}
+
+var noopSession = &Session{} // shared no-op instance returned from FromContext when ctx has none
+
 const (
 	// EnvDir overrides the sessions directory.
 	EnvDir = "GENIE_SESSIONS_DIR"
 )
 
-// Record is one LLM call. Marshalled to a single JSONL line.
+// Record is one event in the resolution trace. Marshalled to a
+// single JSONL line. The Call field discriminates which fields are
+// populated:
+//
+//	query / query_end : Provider + Query + QueryID
+//	cache_l1, cache_l2: Provider + Field + Hash + Hit
+//	normalize, generate: SystemText + UserText + Response + Usage
+//	tool_call          : Tool + ToolArgs + ResultBytes + DurationMS
+//
+// All records carry SessionID + QueryID + Timestamp so a reader can
+// group + order them.
 type Record struct {
-	Timestamp  time.Time `json:"timestamp"`
-	SessionID  string    `json:"session_id"`
-	Call       string    `json:"call"` // "normalize" | "generate"
-	Provider   string    `json:"provider,omitempty"`
-	Field      string    `json:"field,omitempty"` // GraphQL field name being resolved
-	Backend    string    `json:"backend,omitempty"`
-	SystemText string    `json:"system,omitempty"` // concatenated SystemBlocks
-	UserText   string    `json:"user,omitempty"`
-	Response   string    `json:"response,omitempty"`
-	Err        string    `json:"error,omitempty"`
-	Usage      *Usage    `json:"usage,omitempty"`
-	DurationMS int64     `json:"duration_ms"`
+	Timestamp time.Time `json:"timestamp"`
+	SessionID string    `json:"session_id"`
+	QueryID   string    `json:"query_id,omitempty"`
+	Call      string    `json:"call"`
+
+	// Common identifying fields.
+	Provider string `json:"provider,omitempty"`
+	Field    string `json:"field,omitempty"`
+	Backend  string `json:"backend,omitempty"`
+
+	// Lifecycle events.
+	Query string `json:"query,omitempty"` // raw GraphQL string on `query` start
+
+	// Cache events.
+	Hit  bool   `json:"hit,omitempty"`
+	Hash string `json:"hash,omitempty"`
+
+	// LLM events.
+	SystemText string `json:"system,omitempty"`
+	UserText   string `json:"user,omitempty"`
+	Response   string `json:"response,omitempty"`
+	Usage      *Usage `json:"usage,omitempty"`
+
+	// Tool-call events.
+	Tool        string         `json:"tool,omitempty"`
+	ToolArgs    map[string]any `json:"tool_args,omitempty"`
+	ResultBytes int            `json:"result_bytes,omitempty"`
+
+	// Always populated where it makes sense.
+	Err        string `json:"error,omitempty"`
+	DurationMS int64  `json:"duration_ms,omitempty"`
 }
 
 // Usage mirrors llm.Usage but is duplicated here so the session
@@ -123,6 +196,14 @@ func (s *Session) Append(rec Record) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, _ = s.f.Write(append(buf, '\n'))
+}
+
+// AppendCtx is Append with the QueryID auto-populated from ctx.
+func (s *Session) AppendCtx(ctx context.Context, rec Record) {
+	if rec.QueryID == "" {
+		rec.QueryID = QueryIDFromContext(ctx)
+	}
+	s.Append(rec)
 }
 
 // Close flushes and closes the underlying file.
