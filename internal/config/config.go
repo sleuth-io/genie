@@ -99,24 +99,15 @@ func ResolvePath(override string) (string, error) {
 }
 
 // Load reads and parses the config at path, then expands ${env:VAR}
-// references in env values. A missing config file produces a friendly
-// error suggesting a starter config; malformed JSON or unset env-var
-// references are hard failures.
+// references in env values. Missing file or empty mcpServers returns
+// an empty Config — `genie serve` is meant to start cleanly on a
+// fresh install, before any `genie mcp add` has been run. Malformed
+// JSON or unset env-var references are still hard failures.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("config not found at %s\n\n"+
-				"Create one with at least one provider, e.g.:\n\n"+
-				"  {\n"+
-				"    \"mcpServers\": {\n"+
-				"      \"github\": {\n"+
-				"        \"command\": \"github-mcp-server\",\n"+
-				"        \"args\": [\"stdio\"],\n"+
-				"        \"env\": {\"GITHUB_PERSONAL_ACCESS_TOKEN\": \"${env:GITHUB_TOKEN}\"}\n"+
-				"      }\n"+
-				"    }\n"+
-				"  }", path)
+			return &Config{MCPServers: map[string]ProviderConfig{}}, nil
 		}
 		return nil, fmt.Errorf("read config %q: %w", path, err)
 	}
@@ -125,8 +116,8 @@ func Load(path string) (*Config, error) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config %q: %w", path, err)
 	}
-	if len(cfg.MCPServers) == 0 {
-		return nil, fmt.Errorf("config %q: no providers defined under mcpServers", path)
+	if cfg.MCPServers == nil {
+		cfg.MCPServers = map[string]ProviderConfig{}
 	}
 
 	for name, prov := range cfg.MCPServers {

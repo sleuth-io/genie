@@ -47,8 +47,11 @@ type Registry struct {
 
 // NewRegistry connects to one MCP server per configured provider and
 // returns a Registry containing the successful ones. Failed connects
-// are logged at warn level; they do not abort startup. The returned
-// Registry is empty (and an error) only if every provider failed.
+// are logged at warn level; they do not abort startup. Zero
+// configured providers is fine — `genie serve` starts up empty so
+// the user can `genie mcp add` later (after a serve restart). Zero
+// successful connects from a non-empty config is also fine; the
+// failures are surfaced in the log.
 func NewRegistry(ctx context.Context, cfg *config.Config) (*Registry, error) {
 	r := &Registry{
 		clients: make(map[string]*mcpclient.Client, len(cfg.MCPServers)),
@@ -57,12 +60,10 @@ func NewRegistry(ctx context.Context, cfg *config.Config) (*Registry, error) {
 		cfg:     cfg,
 	}
 
-	var failures []string
 	for name, prov := range cfg.MCPServers {
 		c, err := r.connect(ctx, name, prov)
 		if err != nil {
 			slog.Warn("provider connect failed; skipping", "provider", name, "err", err)
-			failures = append(failures, fmt.Sprintf("%s: %v", name, err))
 			continue
 		}
 		r.clients[name] = c
@@ -71,11 +72,6 @@ func NewRegistry(ctx context.Context, cfg *config.Config) (*Registry, error) {
 			"provider", name,
 			"transport", prov.TransportType(),
 			"tools", len(c.Tools()))
-	}
-
-	if len(r.clients) == 0 {
-		return nil, fmt.Errorf("no providers started successfully (%d configured): %v",
-			len(cfg.MCPServers), failures)
 	}
 	return r, nil
 }

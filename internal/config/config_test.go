@@ -60,23 +60,28 @@ func TestLoad_UnsetEnvIsHardError(t *testing.T) {
 	}
 }
 
-func TestLoad_MissingFile(t *testing.T) {
-	_, err := Load("/nonexistent/path/genie-config.json")
-	if err == nil {
-		t.Fatal("expected error for missing file")
+func TestLoad_MissingFileReturnsEmpty(t *testing.T) {
+	cfg, err := Load("/nonexistent/path/genie-config.json")
+	if err != nil {
+		t.Fatalf("missing config should be tolerated, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "config not found") {
-		t.Errorf("error should mention missing config, got: %v", err)
+	if len(cfg.MCPServers) != 0 {
+		t.Errorf("missing config should yield empty MCPServers, got %d entries", len(cfg.MCPServers))
 	}
 }
 
-func TestLoad_EmptyMcpServers(t *testing.T) {
+func TestLoad_EmptyMcpServersIsFine(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
-	_ = writeFile(path, `{"mcpServers": {}}`)
-	_, err := Load(path)
-	if err == nil {
-		t.Fatal("expected error for empty mcpServers")
+	if err := writeFile(path, `{"mcpServers": {}}`); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("empty mcpServers should be tolerated, got: %v", err)
+	}
+	if len(cfg.MCPServers) != 0 {
+		t.Errorf("empty mcpServers should yield 0 entries, got %d", len(cfg.MCPServers))
 	}
 }
 
