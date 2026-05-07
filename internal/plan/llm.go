@@ -865,6 +865,8 @@ Cache the resolution within the script (one dict on the local function frame) so
 
 A cached script may be reused for a paraphrase where the response shape differs subtly. On a successful response (the call did not raise), defensively handle every plausible shape rather than assuming one.
 
+When a tool publishes an Output schema (in the catalog above), use it as the FIRST source of truth for navigation: walk the documented path to find the data list / object, rather than guessing wrapper keys. The defensive ladder below is the FALLBACK for when the schema is absent or the actual response diverges from it. Schemas can be deeply nested (e.g. ` + "`data.users.users[]`" + ` is a real shape) — don't assume the data list lives one level under the root just because that's the most common case.
+
   - When you expect a list, accept any of:
       * a bare ` + "`list`" + ` of dicts
       * a ` + "`dict`" + ` whose value at one of common wrapper keys ({"items", "results", "data", "nodes", "values", "records"}, plus any wrapper key the actual tool's schema names) is the list
@@ -931,8 +933,17 @@ func renderToolCatalog(tools []mcp.Tool) string {
 		if t.Description != "" {
 			fmt.Fprintf(&b, "%s\n", strings.TrimSpace(t.Description))
 		}
-		if schema := renderSchema(t); schema != "" {
+		if schema := renderInputSchema(t); schema != "" {
 			fmt.Fprintf(&b, "Input schema (JSON Schema):\n```json\n%s\n```\n", schema)
+		}
+		// Output schema — when the upstream MCP server publishes one,
+		// surface it. Generated scripts otherwise have to guess
+		// response shapes from the response itself, which falls apart
+		// when the wrapper nesting is non-obvious (e.g. data.users.users).
+		// This is the catalog-driven path — no provider-specific code,
+		// just letting the provider tell us about itself.
+		if schema := renderOutputSchema(t); schema != "" {
+			fmt.Fprintf(&b, "Output schema (JSON Schema):\n```json\n%s\n```\n", schema)
 		}
 		b.WriteString("\n")
 	}
@@ -1066,9 +1077,9 @@ Respond with a single JSON object — no prose, no markdown fence:
 	}
 }
 
-// renderSchema serialises a tool's input schema to a stable, indented JSON
-// string for the prompt. Returns empty if no schema is set.
-func renderSchema(t mcp.Tool) string {
+// renderInputSchema serialises a tool's input schema to a stable, indented
+// JSON string for the prompt. Returns empty if no schema is set.
+func renderInputSchema(t mcp.Tool) string {
 	if t.RawInputSchema != nil {
 		var v any
 		if err := json.Unmarshal(t.RawInputSchema, &v); err == nil {
@@ -1079,6 +1090,28 @@ func renderSchema(t mcp.Tool) string {
 	}
 	if t.InputSchema.Type != "" {
 		b, err := json.MarshalIndent(t.InputSchema, "", "  ")
+		if err == nil {
+			return string(b)
+		}
+	}
+	return ""
+}
+
+// renderOutputSchema serialises a tool's output schema (the response shape
+// the upstream tool returns) to JSON. Optional under MCP — many servers
+// don't publish one; returns empty in that case and the script has to
+// infer the shape from runtime probing.
+func renderOutputSchema(t mcp.Tool) string {
+	if t.RawOutputSchema != nil {
+		var v any
+		if err := json.Unmarshal(t.RawOutputSchema, &v); err == nil {
+			b, _ := json.MarshalIndent(v, "", "  ")
+			return string(b)
+		}
+		return string(t.RawOutputSchema)
+	}
+	if t.OutputSchema.Type != "" {
+		b, err := json.MarshalIndent(t.OutputSchema, "", "  ")
 		if err == nil {
 			return string(b)
 		}
