@@ -36,9 +36,13 @@ type Paraphrase struct {
 	Assertions Assertions `yaml:"assertions"`
 }
 
-// Assertions describe the minimum shape a correct response must satisfy.
-// Empty fields mean "no constraint of this kind".
+// Assertions describe the minimum shape a correct response must
+// satisfy plus optional behavioural constraints that are checked
+// against the JSONL session log produced by the query. Empty fields
+// mean "no constraint of this kind".
 type Assertions struct {
+	// --- Result-shape assertions (read the QueryMap output) -----
+
 	// ListPaths: each path's value must be a non-empty list.
 	ListPaths []string `yaml:"list_paths,omitempty"`
 
@@ -48,6 +52,31 @@ type Assertions struct {
 	// NonemptyPathsInEach: for each (listPath, [field…]) pair, every element
 	// of the list at listPath must have all the listed fields non-null.
 	NonemptyPathsInEach map[string][]string `yaml:"nonempty_paths_in_each,omitempty"`
+
+	// --- Behavioural assertions (inspect the session log) -------
+
+	// MaxDurationMS: scenario fails if total wall time exceeds this.
+	// Useful for catching regressions where a previously-fast cold
+	// run starts dragging.
+	MaxDurationMS int64 `yaml:"max_duration_ms,omitempty"`
+
+	// MaxLLMCalls: scenario fails if more than this many
+	// normalize+generate+regenerate events fire. Catches cases
+	// where SYNTHESIZE should have skipped GENERATE but didn't, or
+	// where regenerate kicked in unexpectedly.
+	MaxLLMCalls int `yaml:"max_llm_calls,omitempty"`
+
+	// ForbidInScripts: substrings that must not appear in any
+	// generated/regenerated script. Catches anti-patterns the
+	// prompts forbid (e.g. "try:" / "except" around tool calls,
+	// which silently swallows errors and breaks the retry loop).
+	ForbidInScripts []string `yaml:"forbid_in_scripts,omitempty"`
+
+	// ExpectSynthesize: field names that MUST have a synthesize
+	// event. Catches regressions where the synthesize fast path
+	// stops firing for cases it should cover (e.g., scalar-leaf
+	// children of an object node).
+	ExpectSynthesize []string `yaml:"expect_synthesize_for,omitempty"`
 }
 
 // Load reads and parses an intents YAML file.

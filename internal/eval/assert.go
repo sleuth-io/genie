@@ -3,6 +3,9 @@ package eval
 import (
 	"fmt"
 	"strings"
+	"time"
+
+	"github.com/sleuth-io/genie/internal/session"
 )
 
 // Check applies all assertions in `a` against `result`. Returns nil on
@@ -84,6 +87,54 @@ func lookup(root map[string]any, path string) (any, bool) {
 		cur = v
 	}
 	return cur, true
+}
+
+// CheckBehavior runs the behavioural assertions against a slice of
+// session records (the events produced during the scenario's query)
+// and the measured wall duration. Independent of Check (the result-
+// shape pass) — both must pass for the scenario to PASS overall.
+func (a Assertions) CheckBehavior(records []session.Record, duration time.Duration) error {
+	if a.MaxDurationMS > 0 && duration.Milliseconds() > a.MaxDurationMS {
+		return fmt.Errorf("max_duration_ms: query took %dms, budget %dms", duration.Milliseconds(), a.MaxDurationMS)
+	}
+
+	if a.MaxLLMCalls > 0 {
+		count := 0
+		for _, r := range records {
+			switch r.Call {
+			case "normalize", "generate", "regenerate":
+				count++
+			}
+		}
+		if count > a.MaxLLMCalls {
+			return fmt.Errorf("max_llm_calls: %d normalize+generate+regenerate events, budget %d", count, a.MaxLLMCalls)
+		}
+	}
+
+	for _, pat := range a.ForbidInScripts {
+		for _, r := range records {
+			if r.Call != "generate" && r.Call != "regenerate" {
+				continue
+			}
+			if strings.Contains(r.Response, pat) {
+				return fmt.Errorf("forbid_in_scripts: %q appears in %s output for field %q", pat, r.Call, r.Field)
+			}
+		}
+	}
+
+	for _, want := range a.ExpectSynthesize {
+		found := false
+		for _, r := range records {
+			if r.Call == "synthesize" && r.Field == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("expect_synthesize_for: no synthesize event for %q (LLM ran GENERATE instead?)", want)
+		}
+	}
+	return nil
 }
 
 // isEmpty matches our notion of "missing data" for assertions: nil,

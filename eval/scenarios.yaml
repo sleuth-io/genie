@@ -1,0 +1,90 @@
+# Smoke scenarios — provider-aware queries that exercise Genie against
+# real upstream MCP servers. Unlike eval/intents.yaml (which uses a
+# programmatic GitHub provider for hypothesis-bar measurement), these
+# run against the user's actual ~/.config/genie/config.json and
+# auto-SKIP any scenario whose provider isn't configured.
+#
+# Run with: genie eval --scenarios eval/scenarios.yaml
+#
+# Add a scenario when you want to lock in "this query shape continues
+# to work for this provider". Useful as a regression catch after
+# prompt edits, engine refactors, or upstream MCP-server changes.
+#
+# Each scenario can carry four kinds of assertion:
+#   - list_paths / nonempty_paths / nonempty_paths_in_each:
+#     correctness — required shape/fields in the result.
+#   - max_duration_ms:
+#     time — fail if cold-call latency regresses past this.
+#   - max_llm_calls:
+#     unnecessary LLM turns — count of normalize+generate+regenerate
+#     events; fail if synthesize stops kicking in for cases it should.
+#   - forbid_in_scripts:
+#     incorrect script behaviour — substrings that must NOT appear in
+#     any generated/regenerated script (catches anti-patterns the
+#     prompt forbids, like try/except around tool calls that hides
+#     upstream errors from the retry loop).
+#   - expect_synthesize_for:
+#     synthesize fast-path coverage — fail if a named field's
+#     subselection went through GENERATE instead of synthesize.
+
+scenarios:
+  # ---- atlassian ---------------------------------------------------
+
+  - id: atlassian-my-issues
+    description: Jira issues assigned to the current user.
+    provider: atlassian
+    query: '{ my_open_issues { key summary status { name } priority { name } updated } }'
+    assertions:
+      list_paths: [my_open_issues]
+      nonempty_paths_in_each:
+        my_open_issues: [key, summary]
+      # status and priority are scalar-leaf object selections over
+      # the parent issue dict — synthesize should fire for both,
+      # not GENERATE.
+      expect_synthesize_for: [status, priority]
+      # Anti-patterns the prompt forbids — try/except around tool
+      # calls hides upstream errors from the regenerate loop.
+      forbid_in_scripts:
+        - "except Exception"
+        - "except:"
+      # Cold first-run budget. Adjust upward as more retries kick in;
+      # a regression past this is signal.
+      max_duration_ms: 120000
+      # 1 NORMALIZE + 1 GENERATE for jira_issues, 1 NORMALIZE each
+      # for status + priority (synthesize handles GENERATE side).
+      # Add 2 for retry budget.
+      max_llm_calls: 6
+
+  - id: atlassian-confluence-recent
+    description: Recently modified Confluence pages.
+    provider: atlassian
+    query: '{ recent_confluence_pages { title updated author { displayName } } }'
+    assertions:
+      list_paths: [recent_confluence_pages]
+      nonempty_paths_in_each:
+        recent_confluence_pages: [title]
+    # NOTE: `space { name }` is intentionally omitted from the
+    # assertion. Confluence search returns shallow records by default;
+    # populating space requires the script to pass `expand=content.space`
+    # or fall back to result.resultGlobalContainer.title. The trace-
+    # review pass identified this as a prompt-education gap rather than
+    # an engine bug. Re-add the field to assertions once the prompt
+    # change has been verified to teach the LLM to expand.
+
+  - id: atlassian-top-epics
+    description: Epics ordered by completion date.
+    provider: atlassian
+    query: '{ top_epics_by_completion_date(limit: 10) { key summary completed_at status { name } } }'
+    assertions:
+      list_paths: [top_epics_by_completion_date]
+      nonempty_paths_in_each:
+        top_epics_by_completion_date: [key, summary]
+
+  # ---- github ------------------------------------------------------
+
+  - id: github-viewer
+    description: Authenticated user's login (singleton object query).
+    provider: github
+    query: '{ viewer { login } }'
+    assertions:
+      nonempty_paths: [viewer.login]

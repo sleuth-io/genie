@@ -35,10 +35,14 @@ func runEval(ctx context.Context, args []string) error {
 	cold := fs.Bool("cold", false, "wipe crystallized dir before running (cold cache)")
 	replay := fs.Bool("replay", false, "after the first run, run again against the warm cache")
 	h3 := fs.Bool("hypothesis-3", false, "run only the adversarial fingerprint set (H3)")
+	scenariosPath := fs.String("scenarios", "", "run provider-tagged smoke scenarios from this YAML against the user's real config")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
+	if *scenariosPath != "" {
+		return runScenarios(ctx, *scenariosPath)
+	}
 	if *h3 {
 		return runHypothesis3(ctx, *advPath, *dir)
 	}
@@ -173,4 +177,36 @@ func newEvalGenie(ctx context.Context, cacheDir string) (*genie.Genie, error) {
 		AnthropicKey: os.Getenv("ANTHROPIC_API_KEY"),
 		CacheDir:     cacheDir,
 	})
+}
+
+// runScenarios drives the smoke-scenarios path: load YAML, build a
+// Genie from the user's real ~/.config/genie/config.json (so the
+// configured providers and cached tokens are in scope), execute
+// each scenario, skip ones whose provider isn't configured. Exits
+// non-zero on any failed scenario; skips alone are not failures.
+func runScenarios(ctx context.Context, path string) error {
+	set, err := eval.LoadScenarios(path)
+	if err != nil {
+		return err
+	}
+	if len(set.Scenarios) == 0 {
+		return eval.ErrNoScenarios
+	}
+
+	g, err := genie.New(ctx, genie.Config{
+		AnthropicKey: os.Getenv("ANTHROPIC_API_KEY"),
+	})
+	if err != nil {
+		return fmt.Errorf("scenarios: build Genie from real config: %w", err)
+	}
+	defer func() { _ = g.Close() }()
+
+	_, _ = fmt.Fprintf(os.Stdout, "Running %d scenarios from %s (providers: %v)\n\n",
+		len(set.Scenarios), path, g.ProviderNames())
+
+	summary := eval.RunScenarios(ctx, g, set, os.Stdout)
+	if summary.Failed > 0 {
+		os.Exit(2)
+	}
+	return nil
 }

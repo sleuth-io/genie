@@ -210,6 +210,47 @@ func (s *Session) AppendCtx(ctx context.Context, rec Record) {
 	s.Append(rec)
 }
 
+// ReadByQueryID re-reads the JSONL file at path and returns every
+// record whose query_id matches. Used by the eval harness to
+// inspect a scenario's trace immediately after the query returns.
+//
+// Returns nil + nil error when path is empty (no-op session) or
+// the file doesn't exist; caller should treat that as "no records,
+// behavioral assertions skipped".
+func ReadByQueryID(path, queryID string) ([]Record, error) {
+	if path == "" {
+		return nil, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("open session log %q: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	dec := json.NewDecoder(f)
+	var out []Record
+	for {
+		var r Record
+		if err := dec.Decode(&r); err != nil {
+			if err.Error() == "EOF" {
+				break
+			}
+			// Don't fail the whole read on one malformed line —
+			// JSONL is append-only and a partial last line during a
+			// concurrent write is a known race. Stop here and
+			// return what we have.
+			break
+		}
+		if r.QueryID == queryID {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
 // Close flushes and closes the underlying file.
 func (s *Session) Close() error {
 	if s == nil || s.f == nil {
