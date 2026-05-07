@@ -173,24 +173,23 @@ func (g *Generator) callLLM(ctx context.Context, callType, field string, system 
 
 // synthesizeProjection returns a deterministic monty script when n is
 // safe to skip GENERATE for: a non-top-level object selection whose
-// children are all scalar leaves with identity renames. The script
-// projects the requested keys out of the parent dict (or list of
-// dicts) the parent script returned. Returns ok=false if any check
-// fails — caller falls through to the LLM-driven GENERATE path.
+// children are all scalar leaves over a parent in hand. The script
+// projects the requested canonical keys out of the parent dict (or
+// list of dicts) the parent script returned. Returns ok=false if any
+// check fails — caller falls through to the LLM-driven GENERATE path.
 //
-// Why we trust this path:
+// Why this is safe regardless of literal-vs-canonical names:
 //
-//   - NORMALIZE has already run. If the LLM thinks any child name
-//     should canonicalise to something different, the rename map
-//     records a non-identity entry and we bail. The LLM's
-//     canonicalisation is the load-bearing semantic step; we only
-//     skip GENERATE when NORMALIZE confirms there's nothing to
-//     translate.
-//   - For the children that pass, the synthesized script is exactly
-//     what GENERATE would have written: `parent.get(name)` per
-//     scalar key. No reasoning involved on either path.
-//   - Output lands in the L2 cache like any other entry. Indis-
-//     tinguishable from an LLM-generated entry on next replay.
+//   - The parent script is canonical-keyed (the GENERATE call that
+//     produced it was instructed to use canonical names per the
+//     normalize step's canonical_schema). So the parent dict's keys
+//     ARE the canonical names of its children.
+//   - This synthesized script also reads canonical names. The
+//     literal-to-canonical translation happens in the engine's
+//     rename projection AROUND this script, not inside it.
+//   - The synthesized output IS what GENERATE would have written:
+//     `parent.get(canonical_key)` per scalar leaf. No reasoning
+//     involved on either path.
 //
 // What we deliberately don't synthesize:
 //
@@ -200,8 +199,13 @@ func (g *Generator) callLLM(ctx context.Context, callType, field string, system 
 //     code path; can't predict from name alone.
 //   - Children with their own selection — recurse normally; the
 //     child's own Generate call will decide whether IT is trivial.
-//   - Non-identity renames — the LLM thinks a translation is needed,
-//     so the script needs the LLM's translation logic.
+//   - Children with their own args — same reason as the parent
+//     having args: arg values may steer a different shape.
+//
+// Earlier this function also bailed when any child rename was
+// non-identity. That check is dropped: the parent already wrote
+// canonical keys, so we read canonical keys; the rename is the
+// engine's job, not ours.
 func (g *Generator) synthesizeProjection(n *engine.Node, parent any, rename *engine.NodeRename) (string, any, bool) {
 	if parent == nil {
 		return "", nil, false
@@ -217,15 +221,17 @@ func (g *Generator) synthesizeProjection(n *engine.Node, parent any, rename *eng
 		if len(child.Selection) > 0 || len(child.Args) > 0 {
 			return "", nil, false
 		}
-		// NORMALIZE must have explicitly recorded an identity entry for
-		// this child. Missing entry ⇒ we don't know it's safe; fall
-		// through to LLM (whose script handles whatever's actually
-		// there).
-		canon, ok := rename.ChildrenLiteralToCanonical[child.Name]
-		if !ok || canon != child.Name {
-			return "", nil, false
+		// Use the canonical name for the projection key. The parent
+		// script writes canonical names; we read canonical names.
+		// Falls back to the literal when no rename was recorded
+		// (which happens for identity cases).
+		canon := child.Name
+		if rename != nil {
+			if c, ok := rename.ChildrenLiteralToCanonical[child.Name]; ok {
+				canon = c
+			}
 		}
-		keys = append(keys, child.Name)
+		keys = append(keys, canon)
 	}
 
 	// Inline the projection literal in both branches. Monty's
@@ -578,8 +584,25 @@ func truncate(s string, n int) string {
 // the cacheable tool catalog (cache breakpoint) followed by the script-
 // generation instructions. The tool catalog renders deterministically so
 // the prompt cache hits across calls.
+//
+// IMPORTANT — DO NOT ADD PROVIDER-SPECIFIC TEXT.
+//
+// Genie is a generic MCP gateway. The exact same prompt is used to drive
+// scripts against GitHub, Atlassian, Linear, Slack, or any other MCP
+// server the user wires up. Provider-specific knowledge (tool names,
+// schema fields, response shapes) MUST come from the runtime-rendered
+// tool catalog (the first block) — never from hardcoded prose here.
+//
+// Examples in this prompt use abstract patterns (e.g. "items / records /
+// data" rather than specific field names like "pull_requests"). If you
+// catch yourself writing a specific tool name or schema field into the
+// preamble, stop — that knowledge belongs in the catalog block, which
+// comes from the upstream MCP server's actual tool list.
+//
+// CacheBreakAfter on BOTH blocks: the catalog and preamble are stable
+// across calls, so caching both saves ~12k tokens/call after the first.
 func buildGenerateSystem(catalog string) []llm.SystemBlock {
-	preamble := `You generate Python (Monty-on-WASM) scripts that resolve a single GraphQL node against the GitHub API via MCP host functions.
+	preamble := `You generate Python (Monty-on-WASM) scripts that resolve a single GraphQL node against the upstream MCP server's tools (the host-function catalog below).
 
 The script you produce is invoked by the engine as:
 
@@ -590,13 +613,34 @@ where:
   - parent is None for top-level nodes; for nodes inside a parent's selection set, it is the parent object as the parent's script returned it (a dict, or one element of a list the parent returned).
 
 Your script MUST define ` + "`def execute(args, parent):`" + ` and return:
-  - a list of dicts when the node is plural (e.g. pull_requests, issues),
-  - a single dict when the node is singular (e.g. viewer, repository),
+  - a list of dicts when the node represents a collection,
+  - a single dict when the node represents one entity,
   - a scalar (str / int / bool) when the node is a scalar leaf.
 
 The engine handles selection projection: return whichever fields might plausibly be requested at this node — the engine drops anything not asked for in the requested selection set. Do NOT manually filter to the requested fields.
 
 The ONLY external surface available to the script is the host-function catalog below. Do not import requests, urllib, subprocess, os, threading, asyncio, etc. Do not call open(). The Monty sandbox does not provide them.
+
+## Project from parent when possible (avoid redundant tool calls)
+
+If ` + "`parent`" + ` is non-None and the requested fields look like simple projections of values already present in the parent dict, return ` + "`{key: parent.get(key) for key in requested_keys}`" + ` directly. Do NOT call host functions for data the parent already supplied. The engine reuses the parent script's output across all child nodes, so re-fetching is pure waste.
+
+## Do NOT swallow host-function errors
+
+When a host function raises (an upstream tool returned an error response), let the exception propagate. The executor catches it and gives you a chance to regenerate the script with the verbatim error in your next prompt — that's how you learn about constraints like "this query needs a filter argument" or "this field requires expand=X".
+
+DO NOT write:
+
+    try:
+        resp = some_tool(...)
+    except Exception:
+        resp = None   # ← swallows real errors, breaks the retry loop
+
+DO write:
+
+    resp = some_tool(...)   # let upstream errors propagate
+
+(Defensive shape handling on the SUCCESSFUL response is fine; see below.)
 
 ## Sandbox Python constraints (verified)
 
@@ -634,31 +678,23 @@ clock API. They're regular host calls — no import needed.
   - days_ago_iso(n=7)     -> "2026-04-29T14:30:00Z"      RFC 3339, UTC, n days ago
   - hours_ago_iso(n=24)   -> "2026-05-05T14:30:00Z"      RFC 3339, UTC, n hours ago
 
-Typical usage for "X in the last 7 days":
-
-    since = days_ago_iso(n=7)
-    items = github_list_pull_requests(owner=..., repo=..., state="open")
-    items = [pr for pr in items if pr.get("created_at", "") >= since]
-
 ## Hallucinated field names
 
 Hallucinated GraphQL field names are intentional: the user may request fields that do not exist on any real schema. Treat the field name as an intent signal — pick the closest sensible interpretation given the available tools and the arg list. If a requested field has no plausible mapping, return null for it; do not raise.
 
-## Defensive shape handling (REQUIRED — cached scripts are reused across paraphrases)
+## Defensive shape handling on SUCCESSFUL responses
 
-GitHub MCP tool responses are not always plain lists. A cached script may be reused for a paraphrase where the response shape differs subtly. Your script MUST defensively handle every plausible response shape rather than assuming one. Cached scripts that crash on shape variation poison the cache for every future paraphrase that L2-hits them.
-
-Concretely:
+A cached script may be reused for a paraphrase where the response shape differs subtly. On a successful response (the call did not raise), defensively handle every plausible shape rather than assuming one.
 
   - When you expect a list, accept any of:
       * a bare ` + "`list`" + ` of dicts
-      * a ` + "`dict`" + ` whose value at one of {"items", "issues", "pull_requests", "commits", "repositories", "results", "data", "nodes"} is the list
+      * a ` + "`dict`" + ` whose value at one of common wrapper keys ({"items", "results", "data", "nodes", "values", "records"}, plus any wrapper key the actual tool's schema names) is the list
       * an empty/None response
     Pseudocode:
         if isinstance(resp, list):
             items = resp
         elif isinstance(resp, dict):
-            items = resp.get("items") or resp.get("issues") or resp.get("pull_requests") or resp.get("commits") or resp.get("repositories") or resp.get("results") or resp.get("data") or resp.get("nodes") or []
+            items = resp.get("items") or resp.get("results") or resp.get("data") or resp.get("nodes") or resp.get("values") or resp.get("records") or []
         else:
             items = []
 
@@ -669,16 +705,20 @@ Concretely:
             ...
 
   - When projecting nested objects, default to ` + "`{}`" + ` and use ` + "`.get()`" + `:
-        user = (pr.get("user") or {})
-        login = user.get("login")
+        sub = (item.get("sub_obj") or {})
+        val = sub.get("name")
 
-  - On a single-object query (e.g. viewer, repository), accept either a bare dict or a wrapper:
+  - On a single-object query, accept either a bare dict or a {"data": {...}} wrapper:
         if isinstance(resp, dict) and "data" in resp and isinstance(resp["data"], dict):
             obj = resp["data"]
         else:
             obj = resp if isinstance(resp, dict) else {}
 
 Never assume a key is present. Never assume a value is the type you expect. The engine treats a None at a missing field as "not requested" and that's fine.
+
+## Expand parameters
+
+Many tools return shallow records by default and require an explicit ` + "`expand=`" + `, ` + "`fields=`" + `, or ` + "`include=`" + ` argument to populate nested objects. If the tool's schema (above) lists fields under ` + "`_expandable`" + ` or notes that they require expansion, set the appropriate parameter rather than relying on ` + "`.get()`" + ` returning the value silently.
 
 ## Output format
 
@@ -692,7 +732,7 @@ Respond with a single JSON object, no prose, no markdown fence:
 
 	return []llm.SystemBlock{
 		{Text: catalog, CacheBreakAfter: true},
-		{Text: preamble},
+		{Text: preamble, CacheBreakAfter: true},
 	}
 }
 
@@ -723,90 +763,88 @@ func renderToolCatalog(tools []mcp.Tool) string {
 // buildNormalizeSystem assembles the system blocks for the NORMALIZE call.
 // Same cacheable tool catalog as Generate (so we get cache hits across both
 // call types), then the canonicalisation instructions.
+//
+// IMPORTANT — DO NOT ADD PROVIDER-SPECIFIC TEXT.
+//
+// Same rule as buildGenerateSystem: this prompt drives normalize for ANY
+// MCP server (GitHub, Atlassian, Linear, Slack, …). Provider-specific
+// canonical names come from the runtime-rendered tool catalog (the
+// first block); never hardcode mappings like "openPRs → pull_requests"
+// here. Examples below use ABSTRACT patterns to illustrate the rules.
+//
+// CacheBreakAfter on BOTH blocks so the prompt cache hits past the
+// preamble too — saves ~10k tokens/call after the first.
 func buildNormalizeSystem(catalog string) []llm.SystemBlock {
 	preamble := `You receive a GraphQL node — a (possibly hallucinated) field name, its argument names, and its recursive selection — and produce a canonical, normalised representation of the same intent.
 
 Two different surface phrasings with the same meaning MUST produce the same canonical schema. This is the LOAD-BEARING contract — getting it wrong fragments the cache and wastes a generation. Be aggressive about collapsing paraphrases.
 
-## Canonical name table (memorise these mappings)
+## How to choose canonical names
 
-Top-level fields — always map to the snake_case form (typically the GitHub MCP tool name without the leading "list_" or "get_" prefix):
+Use the tool catalog above as your source of truth. The catalog lists the actual tool names and input/output schemas the upstream MCP server exposes. Canonical names should track those, not the user's surface form.
 
-  openPRs, pullRequests, prs, pull_request_list  → "pull_requests"
-  openIssues, issues_list, issueList, issue_list → "issues"
-  recent_commits, commitHistory, commits         → "commits"
-  myProfile, currentUser, viewer, me             → "viewer"
-  repo, repository, repository_info               → "repository"
-  search                                          → keep "search_repositories" / "search_issues" / etc. based on the searched type
+Rules:
 
-Nested selection fields:
+  - Field names: snake_case, lowercase.
+  - Top-level fields: prefer the underlying tool's primary entity name (e.g. the noun in the tool name, stripped of "list_", "get_", "search_" prefixes). If multiple tools could plausibly serve the request, pick the one whose schema best matches the user's args + selection.
+  - Nested selection fields: prefer the field name the underlying tool's response actually returns (visible in the tool's output schema). The user's literal name goes in field_rename.
+  - Args: prefer the underlying tool's parameter name. The user's literal goes in arg_rename.
 
-  username                  → "login"
-  user, owner.user          → "user"   (object) — its login lives at .login
-  hash                      → "sha"
-  description, summary      → "body" or "description" — pick what the underlying tool returns; default "body" for issues/PRs, "description" for repos
-  star_count, stargazers    → "stargazers_count"
-  fork_count                → "forks_count"
-  num_reviewers, reviewer_count → "reviewer_count" (synthesised; doc "from reviewRequests/reviews count")
-  days_open, time_open      → "days_open"           (synthesised; doc as "derived from created_at + now")
-
-Args:
-
-  name (when on a single repo) → "repo"
-  q, search_query, term         → "query"
-  since, after_date              → "since"
-  state values "OPEN"/"CLOSED" / "open"/"closed" — keep canonical name "state"; pick a single canonical value form (lowercase) only when the value is part of the schema (don't move state values into the canonical schema; the rename handles it).
-
-When in doubt, prefer the underlying tool's primary input/output field name over the user's surface form.
+When in doubt, prefer the tool catalog's primary input/output name over the user's surface form.
 
 ## Do NOT collapse semantically-distinct args
 
-Two args that pick different facets of the same entity are NOT the same. Keep them distinct in the canonical schema:
+Two args that pick different facets of the same entity are NOT the same. Keep them distinct in the canonical schema even if their canonical names differ from the user's literals. Examples of distinctions worth preserving (general patterns; check the actual tool catalog for which apply):
 
-  author      ≠ committer        (commits — wrote vs applied)
-  author      ≠ reviewer         (PRs — wrote vs reviews)
-  reviewer    ≠ assignee         (PRs — gates merge vs owns work)
-  base        ≠ head             (PRs — target vs source branch)
-  followers   ≠ following        (users — opposite direction)
-  labels      ≠ milestone        (issues — orthogonal filters)
+  - "wrote it" vs "applied it" vs "approved it"
+  - "owns the work" vs "approves the work"
+  - "source" vs "target" of a relation
+  - opposite directions of a relation
+  - orthogonal filters that combine
 
 The script-side handles arg VALUES at runtime, but arg NAMES with different semantics drive different code paths and therefore different cached scripts. Preserve them.
 
 ## Implied-arg rule (paraphrases that elide a default)
 
-When the user's surface form implies an arg via the field name itself (e.g. "openPRs" implies state=open, "recentCommits" implies a default branch), include that arg name in the canonical_schema's args list and surface it in arg_rename. This is what makes "openPRs" collide with "pull_requests(state: 'open')":
+When the user's surface form implies an arg via the field name itself (e.g. a name like "open_X" implies a state=open filter), include that arg name in the canonical_schema's args list. This is what makes paraphrases collide:
 
-  Input:  { openPRs(owner: "x", repo: "y") { title number } }
+  Input:  { open_X(owner: "x", repo: "y") { ... } }
+  Implies: state="open"
   Output: canonical_schema.args = ["owner", "repo", "state"]
           arg_rename = {"owner": "owner", "repo": "repo"}    # state isn't user-supplied here, so no entry
 
   The script can default args.get("state", "open") at runtime; the engine doesn't need to inject a value. The point is the canonical args LIST matches the underlying tool's args, so paraphrases collide.
 
-## Worked examples
+## Worked examples (illustrative — apply the same rules to whatever tools are in the catalog)
 
-Input:  { openIssues(owner: "x", repo: "y") { title num } }
-Output: canonical_schema = { field: "issues", args: ["owner", "repo"], selection: [{field: "number"}, {field: "title"}] }
-        arg_rename   = {"owner": "owner", "repo": "repo"}
+These examples use abstract names. The point is the SHAPE of the rename, not the specific mappings.
+
+Input:  { thingies(filter_a: "x", filter_b: "y") { title num } }
+        (Catalog has tool "list_things" returning items with "title" and "number" fields.)
+Output: canonical_schema = { field: "things", args: ["filter_a", "filter_b"], selection: [{field: "number"}, {field: "title"}] }
+        arg_rename   = {"filter_a": "filter_a", "filter_b": "filter_b"}
         field_rename = {"title": "title", "num": "number"}
 
-Input:  { repo(owner: "x", name: "y") { description star_count } }
-Output: canonical_schema = { field: "repository", args: ["owner", "repo"], selection: [{field: "description"}, {field: "stargazers_count"}] }
-        arg_rename   = {"owner": "owner", "name": "repo"}
-        field_rename = {"description": "description", "star_count": "stargazers_count"}
+Input:  { thing(by_alias: "abc", display_name: "y") { description count } }
+        (Catalog has tool "get_thing" taking "id" and "name", returning "description" and "count".)
+Output: canonical_schema = { field: "thing", args: ["id", "name"], selection: [{field: "count"}, {field: "description"}] }
+        arg_rename   = {"by_alias": "id", "display_name": "name"}
+        field_rename = {"description": "description", "count": "count"}
 
 Input:  { author { username } }
+        (Catalog tool returns user objects whose primary identifier is "login".)
 Output: canonical_schema = { field: "user", args: [], selection: [{field: "login"}] }
         arg_rename   = {}
         field_rename = {"username": "login"}
 
 ## Output rules — these are LOAD-BEARING for the cache key
 
-  - Field names: snake_case, lowercase. Use the canonical-table mappings above.
+  - Field names: snake_case, lowercase. Use names derived from the tool catalog.
   - Args: alphabetical order, deduplicated, no values.
   - Selection: alphabetical order by canonical field name.
   - Scalar leaves get empty args and empty selection.
   - DO NOT include arg values in the canonical_schema.
-  - DO NOT keep paraphrase-specific names ("openIssues", "openPRs") in the canonical_schema; map them. The rename maps preserve the literal names so the engine can translate around the cached script.
+  - DO NOT keep paraphrase-specific surface names in the canonical_schema; map them. The rename maps preserve the literal names so the engine can translate around the cached script.
 
 Respond with a single JSON object — no prose, no markdown fence:
 
@@ -827,25 +865,10 @@ Respond with a single JSON object — no prose, no markdown fence:
     }
 
 ` + "`arg_rename`" + ` covers ONLY the args at THIS top-level node. ` + "`field_rename`" + ` covers ONLY the direct children of THIS node (not deeper levels — children are normalised on their own descent). Both maps are required even if every entry is identity (literal == canonical) — emit identity entries explicitly.
-
-Worked example for input ` + "`{ openPRs(name: \"sdk\") { title num }`" + `:
-
-    {
-      "canonical_schema": {
-        "field": "pull_requests",
-        "args": ["repo"],
-        "selection": [
-          {"field": "number", "args": [], "selection": []},
-          {"field": "title", "args": [], "selection": []}
-        ]
-      },
-      "arg_rename":   {"name": "repo"},
-      "field_rename": {"title": "title", "num": "number"}
-    }
 `
 	return []llm.SystemBlock{
 		{Text: catalog, CacheBreakAfter: true},
-		{Text: preamble},
+		{Text: preamble, CacheBreakAfter: true},
 	}
 }
 
