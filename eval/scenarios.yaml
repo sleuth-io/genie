@@ -80,23 +80,27 @@ scenarios:
       nonempty_paths_in_each:
         top_epics_by_completion_date: [key, summary]
 
-  - id: atlassian-my-issues-this-week
+  - id: atlassian-my-issues-recent
     description: |
-      Issues touched this week. Tests two cold-call regressions:
+      Issues touched recently. Tests two cold-call regressions:
         1. Hallucinated nested object (`last_updater { displayName }`) —
            parent's GENERATE projects literal `displayName`; child's
            NORMALIZE picks canonical `display_name`. Synthesize must
            read both keys to survive the divergence.
-        2. Numeric time arg (`days: 7`) — the int must reach
+        2. Numeric time arg (`days: 90`) — the int must reach
            days_ago_iso(n) and produce a JQL `updated >=` clause.
            If the script guards with isinstance(str) it silently
            drops the filter and returns issues from any time period.
+
+      90-day window is wide enough to virtually guarantee data on
+      any active developer's Jira. Tighten if your test account is
+      always-active and you want a sharper freshness check.
     provider: atlassian
-    query: '{ my_issues_this_week(days: 7) { key summary status { name } updated last_updater { displayName } } }'
+    query: '{ my_issues_recent(days: 90) { key summary status { name } updated last_updater { displayName } } }'
     assertions:
-      list_paths: [my_issues_this_week]
+      list_paths: [my_issues_recent]
       nonempty_paths_in_each:
-        my_issues_this_week: [key, summary, last_updater.displayName]
+        my_issues_recent: [key, summary, last_updater.displayName]
       expect_synthesize_for: [status, last_updater]
       forbid_in_scripts:
         - "except Exception"

@@ -123,15 +123,16 @@ func (a Assertions) CheckBehavior(records []session.Record, duration time.Durati
 	}
 
 	for _, want := range a.ExpectSynthesize {
-		found := false
+		// Pass if no fresh GENERATE fired for this field. A
+		// synthesize event, an L1 cache hit, or an L2 cache hit on
+		// an earlier synthesize all qualify — they're indistin-
+		// guishable from the user's perspective and they all skip
+		// the LLM cost. A fresh GENERATE is the only failure mode
+		// (the synthesize gate let one through).
 		for _, r := range records {
-			if r.Call == "synthesize" && r.Field == want {
-				found = true
-				break
+			if r.Call == "generate" && r.Field == want {
+				return fmt.Errorf("expect_synthesize_for: GENERATE fired for %q (synthesize gate let it through, paid LLM cost)", want)
 			}
-		}
-		if !found {
-			return fmt.Errorf("expect_synthesize_for: no synthesize event for %q (LLM ran GENERATE instead?)", want)
 		}
 	}
 	return nil

@@ -269,9 +269,15 @@ func (g *Genie) Query(ctx context.Context, req QueryRequest) (*Result, error) {
 	// Tag every record produced during this Query with one
 	// query_id so a session reader can group cache events, LLM
 	// calls, and tool calls back to a single user request.
-	queryID := session.NewQueryID()
+	//
+	// Respect an existing query_id in ctx (the eval scenario
+	// runner pre-tags ctx so it can filter the JSONL log to one
+	// scenario's records). Only mint a new ID when the caller
+	// didn't.
 	ctx = session.WithSession(ctx, g.session)
-	ctx = session.WithQueryID(ctx, queryID)
+	if session.QueryIDFromContext(ctx) == "" {
+		ctx = session.WithQueryID(ctx, session.NewQueryID())
+	}
 
 	g.session.AppendCtx(ctx, session.Record{
 		Call:     "query",

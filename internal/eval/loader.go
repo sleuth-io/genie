@@ -72,10 +72,13 @@ type Assertions struct {
 	// which silently swallows errors and breaks the retry loop).
 	ForbidInScripts []string `yaml:"forbid_in_scripts,omitempty"`
 
-	// ExpectSynthesize: field names that MUST have a synthesize
-	// event. Catches regressions where the synthesize fast path
-	// stops firing for cases it should cover (e.g., scalar-leaf
-	// children of an object node).
+	// ExpectSynthesize: field names that must NOT trigger a fresh
+	// GENERATE LLM call. The fast path either is the synthesize
+	// emitter (on a cold L2 miss) OR the L1/L2 cache hit on an
+	// entry that synthesize wrote earlier. Both are fine — what
+	// fails the check is a fresh GENERATE event for the named
+	// field, which means the synthesize gate didn't catch a case
+	// it should have.
 	ExpectSynthesize []string `yaml:"expect_synthesize_for,omitempty"`
 }
 
