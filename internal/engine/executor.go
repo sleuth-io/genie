@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 
 	"github.com/sleuth-io/genie/internal/runtime"
 )
@@ -197,18 +199,33 @@ func (e *Executor) resolveNode(
 		raw, _, err = e.eng.Run(ctx, mod, "execute",
 			map[string]any{"args": argMap, "parent": parent}, e.caps)
 	}
-	if err != nil {
-		// One LLM-driven retry: hand the generator the previous
-		// script + error so it can adjust. The retry path skips
-		// cache, runs a fresh GENERATE call, and replaces the
-		// cached entry on success so future calls get the fixed
-		// version.
-		newSrc, newRename, newRaw, retried := e.tryRetry(ctx, n, parent, argMap, src, err.Error())
-		if !retried {
-			return nil, fmt.Errorf("run script for %q: %w", n.Name, err)
+	// LLM-driven retry loop: each attempt feeds the previous
+	// script + error to the generator so it can iterate. The
+	// upstream constraint may take more than one shot to discover
+	// (e.g. Atlassian: "JQL required" → fix → "field 'foo' not
+	// indexed for search" → fix again). The cache holds whatever
+	// the LLM last wrote; future calls hit it directly when the
+	// last attempt was good, or re-enter the retry loop otherwise.
+	for attempt := 0; err != nil && attempt < retryLimit(); attempt++ {
+		newSrc, newRename, newRaw, attemptErr := e.attemptRetry(ctx, n, parent, argMap, src, err.Error())
+		if newSrc == "" {
+			// Generator doesn't support retry, or the retry call
+			// itself failed (e.g. LLM error). Surface the original
+			// error.
+			break
 		}
-		src, rename, raw = newSrc, newRename, newRaw
-		_ = src // retained for clarity; future debug hooks may want it
+		if attemptErr == nil {
+			rename, raw = newRename, newRaw
+			err = nil
+			break
+		}
+		// Regenerated script also broke; carry forward for the
+		// next iteration's prompt.
+		src, rename = newSrc, newRename
+		err = attemptErr
+	}
+	if err != nil {
+		return nil, fmt.Errorf("run script for %q: %w", n.Name, err)
 	}
 
 	composed, err := e.composeChildren(ctx, n, raw, rename, memo)
@@ -219,37 +236,59 @@ func (e *Executor) resolveNode(
 	return composed, nil
 }
 
-// tryRetry asks the generator (if it supports retry) for a fixed
-// script given the previous script + error, then attempts to compile
-// and run the new script. Returns ok=true with the new (script,
-// rename, result) on success; ok=false leaves the caller to surface
-// the original error. Capped at one retry per node — runaway loops
-// are worse than a clean error.
-func (e *Executor) tryRetry(
+// attemptRetry is one regenerate-and-run cycle. Returns:
+//   - newSrc == "" if the generator declined to retry (no
+//     ScriptRetryer interface, or the LLM call itself errored).
+//     Caller surfaces the original error.
+//   - newSrc set + err == nil: regeneration produced a working
+//     script; raw holds the result. Caller swaps in the new
+//     state and proceeds to composeChildren.
+//   - newSrc set + err != nil: the new script also broke (compile
+//     or run). Caller carries newSrc + err forward to the next
+//     iteration so the LLM sees what it just got wrong.
+func (e *Executor) attemptRetry(
 	ctx context.Context,
 	n *Node,
 	parent any,
 	argMap map[string]any,
 	prevScript, prevErr string,
-) (string, *NodeRename, any, bool) {
+) (string, *NodeRename, any, error) {
 	retryer, ok := e.gen.(ScriptRetryer)
 	if !ok {
-		return "", nil, nil, false
+		return "", nil, nil, errors.New("generator does not support retry")
 	}
 	newSrc, newRename, err := retryer.Regenerate(ctx, n, parent, prevScript, prevErr)
 	if err != nil {
-		return "", nil, nil, false
+		return "", nil, nil, err
 	}
 	mod, err := e.eng.Compile(newSrc)
 	if err != nil {
-		return "", nil, nil, false
+		return newSrc, newRename, nil, fmt.Errorf("compile: %w", err)
 	}
 	raw, _, err := e.eng.Run(ctx, mod, "execute",
 		map[string]any{"args": argMap, "parent": parent}, e.caps)
 	if err != nil {
-		return "", nil, nil, false
+		return newSrc, newRename, nil, fmt.Errorf("run: %w", err)
 	}
-	return newSrc, newRename, raw, true
+	return newSrc, newRename, raw, nil
+}
+
+// retryLimit returns the maximum number of retry attempts per
+// resolveNode call. Configurable via GENIE_RETRY_LIMIT for users
+// hitting providers with multi-step constraint discovery.
+//
+// Default of 3 is the sweet spot empirically: most failures
+// resolve on the first retry (the LLM saw the error, fixed it),
+// occasional second retry (the fix introduced a new issue), and
+// 3+ rarely converges — better to surface the failure and let the
+// human adjust the query.
+func retryLimit() int {
+	if v := os.Getenv("GENIE_RETRY_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return 3
 }
 
 // composeChildren walks the selection set on every result element. Lists
