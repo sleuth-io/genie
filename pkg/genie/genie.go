@@ -30,6 +30,7 @@ import (
 	"github.com/sleuth-io/genie/internal/llm"
 	"github.com/sleuth-io/genie/internal/mcpclient"
 	"github.com/sleuth-io/genie/internal/plan"
+	"github.com/sleuth-io/genie/internal/progress"
 	"github.com/sleuth-io/genie/internal/providers"
 	"github.com/sleuth-io/genie/internal/runtime"
 	"github.com/sleuth-io/genie/internal/sandbox"
@@ -277,6 +278,7 @@ func (g *Genie) Query(ctx context.Context, req QueryRequest) (*Result, error) {
 		Provider: req.Provider,
 		Query:    req.Query,
 	})
+	progress.Report(ctx, "Planning resolution against %q…", req.Provider)
 	start := time.Now()
 
 	parsed, err := engine.Parse(req.Query)

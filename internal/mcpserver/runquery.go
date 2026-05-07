@@ -9,12 +9,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
+	"github.com/sleuth-io/genie/internal/progress"
 	"github.com/sleuth-io/genie/internal/providers"
 )
 
@@ -37,7 +41,7 @@ func NewServer(version string, runner QueryRunner, lister ProviderLister) *serve
 	s := server.NewMCPServer("genie", version,
 		server.WithToolCapabilities(false),
 	)
-	s.AddTool(runQueryTool(lister), runQueryHandler(runner, lister))
+	s.AddTool(runQueryTool(lister), runQueryHandler(s, runner, lister))
 	s.AddTool(listProvidersTool(), listProvidersHandler(lister))
 	return s
 }
@@ -73,7 +77,7 @@ func runQueryTool(lister ProviderLister) mcp.Tool {
 	}
 }
 
-func runQueryHandler(runner QueryRunner, lister ProviderLister) server.ToolHandlerFunc {
+func runQueryHandler(srv *server.MCPServer, runner QueryRunner, lister ProviderLister) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 
@@ -93,6 +97,8 @@ func runQueryHandler(runner QueryRunner, lister ProviderLister) server.ToolHandl
 			return mcp.NewToolResultError("missing required arg: query"), nil
 		}
 
+		ctx = withProgressFromRequest(ctx, srv, req)
+
 		result, err := runner(ctx, provider, query)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("resolution failed: %v", err)), nil
@@ -104,6 +110,37 @@ func runQueryHandler(runner QueryRunner, lister ProviderLister) server.ToolHandl
 		}
 		return mcp.NewToolResultText(string(buf)), nil
 	}
+}
+
+// withProgressFromRequest wires a progress.Sender into ctx when the
+// caller opted into progress notifications via _meta.progressToken.
+// Each Sender call ships one notifications/progress message with an
+// elapsed-time prefix and a monotonically-increasing progress
+// counter.
+//
+// Returns ctx unchanged when the client didn't provide a token —
+// progress.Report is a no-op in that case, so call sites need not
+// branch.
+func withProgressFromRequest(ctx context.Context, srv *server.MCPServer, req mcp.CallToolRequest) context.Context {
+	if req.Params.Meta == nil || req.Params.Meta.ProgressToken == nil {
+		return ctx
+	}
+	token := req.Params.Meta.ProgressToken
+	start := time.Now()
+	var counter atomic.Int64
+	sender := func(msg string) {
+		counter.Add(1)
+		elapsed := time.Since(start).Seconds()
+		params := map[string]any{
+			"progressToken": token,
+			"progress":      float64(counter.Load()),
+			"message":       fmt.Sprintf("[%.1fs] %s", elapsed, msg),
+		}
+		if err := srv.SendNotificationToClient(ctx, "notifications/progress", params); err != nil {
+			slog.Debug("progress send failed", "err", err)
+		}
+	}
+	return progress.WithSender(ctx, sender)
 }
 
 func listProvidersTool() mcp.Tool {

@@ -28,6 +28,7 @@ import (
 	"github.com/sleuth-io/genie/internal/engine"
 	"github.com/sleuth-io/genie/internal/llm"
 	"github.com/sleuth-io/genie/internal/mcpclient"
+	"github.com/sleuth-io/genie/internal/progress"
 	"github.com/sleuth-io/genie/internal/session"
 )
 
@@ -117,6 +118,14 @@ func NewGenerator(c *mcpclient.Client, store *crystallize.Store, llmClient llm.C
 // "normalize" or "generate"; field is the GraphQL field name being
 // resolved (for context when reading the log).
 func (g *Generator) callLLM(ctx context.Context, callType, field string, system []llm.SystemBlock, userText string) (llm.Response, error) {
+	switch callType {
+	case "normalize":
+		progress.Report(ctx, "Normalizing %q…", field)
+	case "generate":
+		progress.Report(ctx, "Generating script for %q…", field)
+	default:
+		progress.Report(ctx, "%s %q…", callType, field)
+	}
 	start := time.Now()
 	resp, err := g.client.Generate(ctx, system, userText)
 	rec := session.Record{

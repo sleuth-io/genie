@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/sleuth-io/genie/internal/progress"
 	"github.com/sleuth-io/genie/internal/runtime"
 	"github.com/sleuth-io/genie/internal/session"
 )
@@ -24,6 +25,7 @@ import (
 //   - error if any
 func wrapToolFunc(provider, fnName string, inner runtime.GoFunc) runtime.GoFunc {
 	return func(ctx context.Context, call *runtime.FunctionCall) (any, error) {
+		progress.Report(ctx, "Calling %s…", call.Name)
 		start := time.Now()
 		result, err := inner(ctx, call)
 
