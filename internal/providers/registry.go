@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/sleuth-io/genie/internal/auth"
@@ -68,7 +69,7 @@ func NewRegistry(ctx context.Context, cfg *config.Config) (*Registry, error) {
 			continue
 		}
 		r.clients[name] = c
-		r.info[name] = Info{Name: name, Description: prov.Description}
+		r.info[name] = Info{Name: name, Description: deriveDescription(name, prov, c)}
 		r.entries[name] = prov
 		slog.Info("provider ready",
 			"provider", name,
@@ -76,6 +77,58 @@ func NewRegistry(ctx context.Context, cfg *config.Config) (*Registry, error) {
 			"tools", len(c.Tools()))
 	}
 	return r, nil
+}
+
+// deriveDescription picks the best description we can offer to
+// list_providers, in this order:
+//
+//  1. The user's explicit `description` from the config.
+//  2. The MCP server's `instructions` field from the initialize
+//     handshake (truncated — servers sometimes return a paragraph).
+//  3. The MCP server's serverInfo.Name + Version.
+//  4. The provider name title-cased — last-resort so list_providers
+//     always returns something.
+func deriveDescription(name string, prov config.ProviderConfig, c *mcpclient.Client) string {
+	if s := strings.TrimSpace(prov.Description); s != "" {
+		return s
+	}
+	if c != nil {
+		if instr := strings.TrimSpace(c.Instructions()); instr != "" {
+			return truncate(firstLine(instr), 200)
+		}
+		if info := c.ServerInfo(); info.Name != "" {
+			if info.Version != "" {
+				return info.Name + " (" + info.Version + ")"
+			}
+			return info.Name
+		}
+	}
+	return titleCase(name)
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max-1] + "…"
+}
+
+func titleCase(s string) string {
+	if s == "" {
+		return s
+	}
+	// ASCII title-case is enough — provider names in the wild are
+	// "atlassian", "linear", "github", etc. unicode.ToTitle is
+	// overkill and would mishandle a-acute-style input we don't
+	// expect.
+	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 // Reload diffs newCfg against the current registry state and applies
@@ -156,7 +209,7 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 	for name, c := range connected {
 		prov := newCfg.MCPServers[name]
 		r.clients[name] = c
-		r.info[name] = Info{Name: name, Description: prov.Description}
+		r.info[name] = Info{Name: name, Description: deriveDescription(name, prov, c)}
 		r.entries[name] = prov
 	}
 	r.mu.Unlock()

@@ -65,8 +65,30 @@ type ProviderSpec struct {
 // underlying transport (subprocess or HTTP connection); Close tears
 // it down.
 type Client struct {
-	mcp   *mcpc.Client
-	tools []mcp.Tool
+	mcp          *mcpc.Client
+	tools        []mcp.Tool
+	serverInfo   mcp.Implementation
+	instructions string
+}
+
+// ServerInfo returns the MCP server's self-identification (name +
+// version) from the initialize handshake. Genie surfaces these in
+// list_providers fallbacks.
+func (c *Client) ServerInfo() mcp.Implementation {
+	if c == nil {
+		return mcp.Implementation{}
+	}
+	return c.serverInfo
+}
+
+// Instructions returns the server's optional instructions string
+// from the initialize handshake. Servers use this to describe
+// themselves to clients in plain text.
+func (c *Client) Instructions() string {
+	if c == nil {
+		return ""
+	}
+	return c.instructions
 }
 
 // OAuthRequiredError is returned from Open when the HTTP transport
@@ -109,13 +131,13 @@ func openStdio(ctx context.Context, spec ProviderSpec) (*Client, error) {
 		return nil, fmt.Errorf("provider %q: spawn %s: %w", spec.Name, spec.Command, err)
 	}
 
-	tools, err := initAndList(ctx, mc, spec.Name)
+	tools, info, instr, err := initAndList(ctx, mc, spec.Name)
 	if err != nil {
 		_ = mc.Close()
 		return nil, err
 	}
 
-	return &Client{mcp: mc, tools: tools}, nil
+	return &Client{mcp: mc, tools: tools, serverInfo: info, instructions: instr}, nil
 }
 
 func openHTTP(ctx context.Context, spec ProviderSpec) (*Client, error) {
@@ -164,7 +186,7 @@ func openHTTP(ctx context.Context, spec ProviderSpec) (*Client, error) {
 		return nil, fmt.Errorf("provider %q: start: %w", spec.Name, err)
 	}
 
-	tools, err := initAndList(ctx, mc, spec.Name)
+	tools, info, instr, err := initAndList(ctx, mc, spec.Name)
 	if err != nil {
 		_ = mc.Close()
 		if isOAuthRequired(err) {
@@ -173,7 +195,7 @@ func openHTTP(ctx context.Context, spec ProviderSpec) (*Client, error) {
 		return nil, err
 	}
 
-	return &Client{mcp: mc, tools: tools}, nil
+	return &Client{mcp: mc, tools: tools, serverInfo: info, instructions: instr}, nil
 }
 
 func isOAuthRequired(err error) bool {
@@ -186,21 +208,22 @@ func isOAuthRequired(err error) bool {
 	return errors.Is(err, transport.ErrOAuthAuthorizationRequired)
 }
 
-func initAndList(ctx context.Context, mc *mcpc.Client, name string) ([]mcp.Tool, error) {
+func initAndList(ctx context.Context, mc *mcpc.Client, name string) ([]mcp.Tool, mcp.Implementation, string, error) {
 	initReq := mcp.InitializeRequest{}
 	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initReq.Params.ClientInfo = mcp.Implementation{
 		Name:    "genie",
 		Version: "dev",
 	}
-	if _, err := mc.Initialize(ctx, initReq); err != nil {
-		return nil, fmt.Errorf("provider %q: mcp initialize: %w", name, err)
+	initRes, err := mc.Initialize(ctx, initReq)
+	if err != nil {
+		return nil, mcp.Implementation{}, "", fmt.Errorf("provider %q: mcp initialize: %w", name, err)
 	}
 	listed, err := mc.ListTools(ctx, mcp.ListToolsRequest{})
 	if err != nil {
-		return nil, fmt.Errorf("provider %q: mcp list tools: %w", name, err)
+		return nil, mcp.Implementation{}, "", fmt.Errorf("provider %q: mcp list tools: %w", name, err)
 	}
-	return listed.Tools, nil
+	return listed.Tools, initRes.ServerInfo, initRes.Instructions, nil
 }
 
 // OpenGitHub is a convenience wrapper that builds the default GitHub MCP
