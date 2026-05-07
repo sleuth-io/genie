@@ -152,6 +152,27 @@ func (e *Executor) resolveNode(
 		}
 	}
 
+	// Null-sub-object short-circuit. If this is an object child
+	// (selection > 0) and the parent dict has either no entry at
+	// the canonical key, or an explicit null at it, the upstream
+	// returned no data for this sub-object — return null directly.
+	// Common cases that hit this path:
+	//   - `parent { ... }` on a top-level task with no parent
+	//   - `lead { ... }` on a project from a list endpoint that
+	//     doesn't expose lead without a separate fetch
+	//   - any nullable object reference whose owner cleared it
+	// The alternative is letting the LLM-driven Generate write a
+	// script that does parent.get(name) and returns None — same
+	// answer, paid in LLM tokens + wall time. Skip it.
+	if len(n.Selection) > 0 && parent != nil {
+		if obj, ok := parent.(map[string]any); ok {
+			v, present := obj[parentRename.canonicalChildName(n.Name)]
+			if !present || v == nil {
+				return nil, nil
+			}
+		}
+	}
+
 	shape := n.Shape()
 	hash := shape.L1Hash()
 
