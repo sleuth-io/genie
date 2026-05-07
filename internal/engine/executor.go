@@ -194,10 +194,20 @@ func (e *Executor) resolveNode(
 	}
 
 	var raw any
-	mod, err := e.eng.Compile(src)
-	if err == nil {
-		raw, _, err = e.eng.Run(ctx, mod, "execute",
-			map[string]any{"args": argMap, "parent": parent}, e.caps)
+	var err error
+	if violation := ValidateScript(src); violation != "" {
+		// Pre-execution validation failure — feed straight into the
+		// retry loop. No compile or run cost paid; the LLM gets one
+		// or more chances to write a compliant script. Same code
+		// path as a runtime error from this point on.
+		err = errors.New(violation)
+	} else {
+		var mod runtime.Module
+		mod, err = e.eng.Compile(src)
+		if err == nil {
+			raw, _, err = e.eng.Run(ctx, mod, "execute",
+				map[string]any{"args": argMap, "parent": parent}, e.caps)
+		}
 	}
 	// LLM-driven retry loop: each attempt feeds the previous
 	// script + error to the generator so it can iterate. The
