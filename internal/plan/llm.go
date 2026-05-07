@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -54,6 +55,8 @@ type Generator struct {
 	tools           []mcp.Tool
 	provider        string // routing key — recorded in session entries
 	session         *session.Session
+	normalizeModel  string // GENIE_NORMALIZE_MODEL — empty ⇒ backend default
+	generateModel   string // GENIE_GENERATE_MODEL — empty ⇒ backend default
 
 	// metrics for hypothesis-2 measurement
 	metrics Metrics
@@ -97,6 +100,13 @@ func (g *Generator) NormalizeOnly(ctx context.Context, n *engine.Node) (string, 
 // scope. The LLM client is injected so callers can pick a backend
 // (Anthropic SDK, Claude Code CLI, …) per the rules in package llm.
 // sess is the JSONL session log; pass nil to skip recording.
+//
+// Per-call-type model overrides are read from env at construction:
+// GENIE_NORMALIZE_MODEL and GENIE_GENERATE_MODEL. NORMALIZE produces
+// small structured output (canonical schema + rename maps) and runs
+// fine on Sonnet/Haiku; GENERATE writes Python and may benefit from
+// Opus. Empty values keep the backend's built-in default (Opus 4.7
+// on the Anthropic SDK; Claude Code's session default for the CLI).
 func NewGenerator(c *mcpclient.Client, store *crystallize.Store, llmClient llm.Client, provider string, sess *session.Session) *Generator {
 	tools := c.Tools()
 	catalog := renderToolCatalog(tools)
@@ -110,6 +120,8 @@ func NewGenerator(c *mcpclient.Client, store *crystallize.Store, llmClient llm.C
 		tools:           tools,
 		provider:        provider,
 		session:         sess,
+		normalizeModel:  os.Getenv("GENIE_NORMALIZE_MODEL"),
+		generateModel:   os.Getenv("GENIE_GENERATE_MODEL"),
 	}
 }
 
@@ -121,8 +133,10 @@ func (g *Generator) callLLM(ctx context.Context, callType, field string, system 
 	switch callType {
 	case "normalize":
 		progress.Report(ctx, "Normalizing %q…", field)
+		ctx = llm.WithModel(ctx, g.normalizeModel)
 	case "generate":
 		progress.Report(ctx, "Generating script for %q…", field)
+		ctx = llm.WithModel(ctx, g.generateModel)
 	default:
 		progress.Report(ctx, "%s %q…", callType, field)
 	}

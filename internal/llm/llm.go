@@ -61,6 +61,29 @@ const (
 // auto-detection. Accepted values match the Backend* constants.
 const BackendEnvVar = "GENIE_LLM_BACKEND"
 
+// modelKey is the context value key for per-call model overrides.
+// The plan generator sets a model per call-type (normalize vs
+// generate); each backend reads it back here and threads it into
+// its API/CLI invocation. Empty string ⇒ use the backend's default.
+type modelKey struct{}
+
+// WithModel attaches a model identifier to ctx. Empty s leaves ctx
+// unchanged so callers can branch-free pass through.
+func WithModel(ctx context.Context, s string) context.Context {
+	if s == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, modelKey{}, s)
+}
+
+// ModelFromContext returns the model attached to ctx, or "".
+func ModelFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(modelKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
 // Select picks a backend based on environment and explicit config.
 // Auto-detection precedence (no GENIE_LLM_BACKEND set):
 //

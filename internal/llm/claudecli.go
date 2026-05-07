@@ -37,8 +37,12 @@ func (c *claudeCLI) Generate(ctx context.Context, system []SystemBlock, userText
 		"--verbose",
 		"--allowedTools", "",
 	}
-	if c.model != "" {
-		args = append(args, "--model", c.model)
+	model := ModelFromContext(ctx)
+	if model == "" {
+		model = c.model
+	}
+	if model != "" {
+		args = append(args, "--model", model)
 	}
 
 	cmd := exec.CommandContext(ctx, c.bin, args...)

@@ -77,6 +77,13 @@ Plan generation needs an LLM. Genie picks one automatically:
 
 Pin one with `GENIE_LLM_BACKEND=anthropic-sdk|claude-cli`.
 
+Genie makes two distinct LLM calls per cache-miss node:
+
+- **NORMALIZE** — small structured-JSON output (canonical schema + rename maps). Sonnet/Haiku is plenty.
+- **GENERATE** — writes a Python script that invokes upstream MCP tools. Benefits from Opus's reasoning.
+
+Override per-call-type with `GENIE_NORMALIZE_MODEL` and `GENIE_GENERATE_MODEL` (full model IDs like `claude-sonnet-4-5-20250929`, or short aliases the claude CLI accepts like `sonnet`). Empty ⇒ backend default (Opus 4.7 for the SDK; Claude Code's session default for the CLI).
+
 ## Authentication
 
 stdio servers authenticate with env vars (`--env`). HTTP/SSE servers use OAuth 2.1 + PKCE with RFC 8414/9728 well-known discovery and RFC 7591 dynamic client registration — no per-provider client setup needed. `genie mcp add` opens the browser flow inline; tokens land in your OS keychain (Keychain / Secret Service / Credential Manager). Refresh is automatic; on revocation the next request re-runs the flow.

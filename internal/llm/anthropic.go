@@ -33,8 +33,13 @@ func (a *anthropicClient) Generate(ctx context.Context, system []SystemBlock, us
 		blocks = append(blocks, bp)
 	}
 
+	model := anthropic.Model(ModelFromContext(ctx))
+	if model == "" {
+		model = anthropic.ModelClaudeOpus4_7
+	}
+
 	params := anthropic.MessageNewParams{
-		Model:     anthropic.ModelClaudeOpus4_7,
+		Model:     model,
 		MaxTokens: 16000,
 		System:    blocks,
 		Thinking: anthropic.ThinkingConfigParamUnion{
