@@ -27,9 +27,11 @@ import (
 
 	"github.com/sleuth-io/genie/internal/crystallize"
 	"github.com/sleuth-io/genie/internal/engine"
+	"github.com/sleuth-io/genie/internal/fixtures"
 	"github.com/sleuth-io/genie/internal/llm"
 	"github.com/sleuth-io/genie/internal/mcpclient"
 	"github.com/sleuth-io/genie/internal/progress"
+	"github.com/sleuth-io/genie/internal/runtime"
 	"github.com/sleuth-io/genie/internal/session"
 )
 
@@ -47,16 +49,20 @@ import (
 //  2. GENERATE — big call, produces the monty script + io_schema.
 //     Only fires if L2 is also a miss.
 type Generator struct {
-	client          llm.Client
-	store           *crystallize.Store
-	generateSystem  []llm.SystemBlock
-	normalizeSystem []llm.SystemBlock
-	toolNames       []string // monty-side names like github_list_pull_requests
-	tools           []mcp.Tool
-	provider        string // routing key — recorded in session entries
-	session         *session.Session
-	normalizeModel  string // GENIE_NORMALIZE_MODEL — empty ⇒ backend default
-	generateModel   string // GENIE_GENERATE_MODEL — empty ⇒ backend default
+	client                llm.Client
+	mcp                   *mcpclient.Client // upstream caller, used by the tool-use loop
+	monty                 *runtime.MontyEngine
+	caps                  *runtime.Capabilities
+	store                 *crystallize.Store
+	generateSystem        []llm.SystemBlock
+	generateSystemToolUse []llm.SystemBlock
+	normalizeSystem       []llm.SystemBlock
+	toolNames             []string // monty-side names like github_list_pull_requests
+	tools                 []mcp.Tool
+	provider              string // routing key — recorded in session entries
+	session               *session.Session
+	normalizeModel        string // GENIE_NORMALIZE_MODEL — empty ⇒ backend default
+	generateModel         string // GENIE_GENERATE_MODEL — empty ⇒ backend default
 
 	// metrics for hypothesis-2 measurement
 	metrics Metrics
@@ -112,17 +118,31 @@ func NewGenerator(c *mcpclient.Client, store *crystallize.Store, llmClient llm.C
 	catalog := renderToolCatalog(tools)
 
 	return &Generator{
-		client:          llmClient,
-		store:           store,
-		generateSystem:  buildGenerateSystem(catalog),
-		normalizeSystem: buildNormalizeSystem(catalog),
-		toolNames:       c.MontyToolNames(),
-		tools:           tools,
-		provider:        provider,
-		session:         sess,
-		normalizeModel:  os.Getenv("GENIE_NORMALIZE_MODEL"),
-		generateModel:   os.Getenv("GENIE_GENERATE_MODEL"),
+		client:                llmClient,
+		mcp:                   c,
+		store:                 store,
+		generateSystem:        buildGenerateSystem(catalog),
+		generateSystemToolUse: buildGenerateSystemToolUse(catalog),
+		normalizeSystem:       buildNormalizeSystem(catalog),
+		toolNames:             c.MontyToolNames(),
+		tools:                 tools,
+		provider:              provider,
+		session:               sess,
+		normalizeModel:        os.Getenv("GENIE_NORMALIZE_MODEL"),
+		generateModel:         os.Getenv("GENIE_GENERATE_MODEL"),
 	}
+}
+
+// WithRunner attaches the monty engine and base capabilities used by
+// the tool-use GENERATE flow's verification step. Optional: when not
+// set (or when the LLM client doesn't support tool-use), Generate
+// falls back to single-turn fullGenerate.
+//
+// Returns the receiver so the constructor can be chained.
+func (g *Generator) WithRunner(monty *runtime.MontyEngine, caps *runtime.Capabilities) *Generator {
+	g.monty = monty
+	g.caps = caps
+	return g
 }
 
 // callLLM is a thin wrapper around g.client.Generate that records
@@ -502,9 +522,27 @@ func (g *Generator) Generate(ctx context.Context, n *engine.Node, parent any) (s
 	// Step 4: full generate. Pass the canonical schema so the LLM emits a
 	// canonical-keyed script (other paraphrases reusing this script via L2
 	// will then see consistent canonical output).
-	out, err := g.fullGenerate(ctx, n, parent, canonSchema)
-	if err != nil {
-		return "", nil, err
+	//
+	// Two paths: tool-use (explore upstream → submit script → verify
+	// against fixtures) when the LLM client supports it AND a runner is
+	// wired; legacy single-turn fullGenerate otherwise. The tool-use
+	// path persists fixtures + expected_output on the entry; the
+	// legacy path leaves them empty.
+	var (
+		out            *llmOutput
+		fixtureSet     fixtures.Set
+		expectedOutput any
+	)
+	if _, isChat := g.client.(llm.ChatClient); isChat && g.monty != nil && g.caps != nil {
+		out, fixtureSet, expectedOutput, err = g.fullGenerateToolUse(ctx, n, parent, canonSchema, rename)
+		if err != nil {
+			return "", nil, err
+		}
+	} else {
+		out, err = g.fullGenerate(ctx, n, parent, canonSchema)
+		if err != nil {
+			return "", nil, err
+		}
 	}
 
 	// Step 5: persist.
@@ -515,6 +553,13 @@ func (g *Generator) Generate(ctx context.Context, n *engine.Node, parent any) (s
 		CanonicalHash:   canonicalHash,
 		MontyScript:     out.MontyScript,
 		IOSchema:        out.IOSchema,
+		ExpectedOutput:  expectedOutput,
+	}
+	if len(fixtureSet) > 0 {
+		fixtureBytes, ferr := json.Marshal(fixtureSet)
+		if ferr == nil {
+			entry.Fixtures = fixtureBytes
+		}
 	}
 	if err := g.store.PutEntry(entry); err != nil {
 		slog.Warn("plan: L2 entry write failed; replay will regenerate",
@@ -599,6 +644,370 @@ func (g *Generator) fullGenerate(ctx context.Context, n *engine.Node, parent any
 	}
 
 	return out, nil
+}
+
+// submitScriptToolName is the synthetic Anthropic tool the model
+// must call to deliver its final monty_script. Distinct from any
+// upstream MCP tool name so collisions are impossible.
+const submitScriptToolName = "submit_script"
+
+// maxToolUseTurns caps the explore-then-submit loop. Enough for
+// real-world resolution chains (catalog inspection → list → resolve
+// → submit) without letting a confused model burn LLM cost
+// unbounded.
+const maxToolUseTurns = 12
+
+// fullGenerateToolUse drives the explore-then-submit GENERATE loop
+// with in-loop verification. The model is given the upstream tool
+// catalog as REAL Anthropic tools, calls them to learn response
+// shapes, and finishes by calling submit_script with {script,
+// expected_output, io_schema}. The engine then runs the submitted
+// script against the captured fixtures, deep-diffs actual output vs
+// expected_output, and either accepts (match) or feeds the diff back
+// for one revision turn (mismatch). Verification is skipped when no
+// runner is wired (g.monty/g.caps unset) — the LLM is trusted in
+// that case.
+//
+// Returns:
+//   - the parsed llmOutput (script + io_schema) the model submitted
+//   - the fixture set captured during exploration (for L2 persist)
+//   - the LLM-stated expected_output (for L2 persist)
+func (g *Generator) fullGenerateToolUse(ctx context.Context, n *engine.Node, parent any, canon *canonicalSchema, rename *engine.NodeRename) (*llmOutput, fixtures.Set, any, error) {
+	chatClient, ok := g.client.(llm.ChatClient)
+	if !ok {
+		return nil, nil, nil, errors.New("llm client does not support tool-use")
+	}
+	if g.mcp == nil {
+		return nil, nil, nil, errors.New("generator has no upstream mcp client wired")
+	}
+
+	userText, err := buildUserPrompt(n, parent, canon)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("build user prompt: %w", err)
+	}
+
+	tools := g.buildToolDefs()
+	messages := []llm.Message{{Role: "user", Text: userText}}
+	fixtureSet := fixtures.Set{}
+	revisions := 0
+	const maxRevisions = 1
+
+	// Build the canonical-keyed args the script will see during
+	// verification: the user's literal args mapped through rename.
+	verifyArgs := map[string]any{}
+	for _, a := range n.Args {
+		key := a.Name
+		if rename != nil {
+			if c, ok := rename.ArgsLiteralToCanonical[a.Name]; ok && c != "" {
+				key = c
+			}
+		}
+		verifyArgs[key] = a.Value
+	}
+
+	progress.Report(ctx, "Generating script for %q (tool-use)…", n.Name)
+	ctx = llm.WithModel(ctx, g.generateModel)
+
+	for turn := 0; turn < maxToolUseTurns; turn++ {
+		req := llm.ChatRequest{
+			System:   g.generateSystemToolUse,
+			Messages: messages,
+			Tools:    tools,
+		}
+
+		start := time.Now()
+		resp, callErr := chatClient.Chat(ctx, req)
+		duration := time.Since(start).Milliseconds()
+		// Record one session entry per chat turn so the trace shows
+		// the loop progression. The full system prompt is captured
+		// only on the first turn (it's stable across turns) — later
+		// turns just record the user/assistant deltas.
+		rec := session.Record{
+			Call:       "generate",
+			Provider:   g.provider,
+			Field:      n.Name,
+			DurationMS: duration,
+		}
+		if turn == 0 {
+			rec.SystemText = joinBlocks(req.System)
+			rec.UserText = userText
+		}
+		if callErr != nil {
+			rec.Err = callErr.Error()
+			g.session.AppendCtx(ctx, rec)
+			return nil, fixtureSet, nil, fmt.Errorf("chat turn %d: %w", turn, callErr)
+		}
+		rec.Usage = &session.Usage{
+			InputTokens:         resp.Usage.InputTokens,
+			OutputTokens:        resp.Usage.OutputTokens,
+			CacheCreationTokens: resp.Usage.CacheCreationTokens,
+			CacheReadTokens:     resp.Usage.CacheReadTokens,
+		}
+		// Render the assistant turn into the response field for
+		// debugging — text + tool calls.
+		respText := resp.Text
+		for _, tu := range resp.ToolUses {
+			tuJSON, _ := json.Marshal(tu.Input)
+			respText += fmt.Sprintf("\n[tool_use %s name=%s input=%s]", tu.ID, tu.Name, string(tuJSON))
+		}
+		rec.Response = respText
+		g.session.AppendCtx(ctx, rec)
+
+		logUsage("generate-toolloop", resp.Usage)
+		g.metrics.GenerateCalls++
+		g.metrics.GenerateInputTokens += resp.Usage.InputTokens
+		g.metrics.GenerateOutputTokens += resp.Usage.OutputTokens
+		g.metrics.CacheReadInputTokens += resp.Usage.CacheReadTokens
+		g.metrics.CacheCreationInputTokens += resp.Usage.CacheCreationTokens
+
+		if len(resp.ToolUses) == 0 {
+			return nil, fixtureSet, nil, fmt.Errorf("turn %d: model emitted text without calling any tool: %q", turn, truncate(resp.Text, 300))
+		}
+
+		messages = append(messages, llm.Message{
+			Role:     "assistant",
+			Text:     resp.Text,
+			ToolUses: resp.ToolUses,
+		})
+
+		results := make([]llm.ToolResult, 0, len(resp.ToolUses))
+		var (
+			submittedOut      *llmOutput
+			submittedExpected any
+			submitFound       bool
+		)
+		for _, tu := range resp.ToolUses {
+			if tu.Name == submitScriptToolName {
+				out, expected, perr := parseSubmitScript(tu.Input)
+				if perr != nil {
+					results = append(results, llm.ToolResult{
+						ToolUseID: tu.ID,
+						Content:   "submit_script invalid: " + perr.Error(),
+						IsError:   true,
+					})
+					continue
+				}
+				submittedOut = out
+				submittedExpected = expected
+				submitFound = true
+				results = append(results, llm.ToolResult{
+					ToolUseID: tu.ID,
+					Content:   "received",
+				})
+				continue
+			}
+			// Real upstream tool call.
+			originalName := strings.TrimPrefix(tu.Name, mcpclient.HostNamePrefix)
+			callStart := time.Now()
+			result, callErr := g.mcp.Call(ctx, originalName, tu.Input)
+			toolRec := session.Record{
+				Call:       "tool_call",
+				Provider:   g.provider,
+				Tool:       tu.Name,
+				ToolArgs:   tu.Input,
+				DurationMS: time.Since(callStart).Milliseconds(),
+			}
+			if callErr != nil {
+				toolRec.Err = callErr.Error()
+				g.session.AppendCtx(ctx, toolRec)
+				results = append(results, llm.ToolResult{
+					ToolUseID: tu.ID,
+					Content:   callErr.Error(),
+					IsError:   true,
+				})
+				continue
+			}
+			toolRec.Result = result
+			g.session.AppendCtx(ctx, toolRec)
+			fixtureSet.Append(tu.Name, tu.Input, result)
+			payload, _ := json.Marshal(result)
+			content := string(payload)
+			if len(content) > 50000 {
+				content = content[:50000] + "\n... [truncated]"
+			}
+			results = append(results, llm.ToolResult{
+				ToolUseID: tu.ID,
+				Content:   content,
+			})
+		}
+
+		if submitFound {
+			// Append the submit acknowledgement (and any other
+			// in-turn tool results) so the message history stays
+			// well-formed for a possible revision turn.
+			messages = append(messages, llm.Message{
+				Role:        "user",
+				ToolResults: results,
+			})
+
+			diffMsg := g.verifySubmitted(ctx, n, submittedOut, submittedExpected, verifyArgs, parent, fixtureSet)
+			if diffMsg == "" {
+				return submittedOut, fixtureSet, submittedExpected, nil
+			}
+			if revisions >= maxRevisions {
+				return nil, fixtureSet, nil, fmt.Errorf("verification failed after %d revision: %s", revisions, diffMsg)
+			}
+			revisions++
+			slog.Warn("plan: verification failed, requesting revision",
+				"field", n.Name,
+				"diff", truncate(diffMsg, 500),
+			)
+			messages = append(messages, llm.Message{
+				Role: "user",
+				Text: "Verification failed. The script you submitted, run against the data you observed during exploration, did not match your expected_output:\n\n" + diffMsg + "\n\nReview your script and your expected_output. One of them is wrong (most often the script — defensive shape handling that returns null when a wrapper key was unexpected is a common cause). Call submit_script again with corrected values.",
+			})
+			continue
+		}
+
+		messages = append(messages, llm.Message{
+			Role:        "user",
+			ToolResults: results,
+		})
+	}
+
+	return nil, fixtureSet, nil, fmt.Errorf("tool-use loop hit %d turn limit without submit_script", maxToolUseTurns)
+}
+
+// verifySubmitted runs the submitted script with mocked capabilities
+// (replay over fixtureSet) and deep-diffs the actual output against
+// the LLM-stated expected_output. Returns "" on match (or when
+// verification is skipped due to no wired runner), or a description
+// of the first divergence suitable for feeding back to the LLM.
+func (g *Generator) verifySubmitted(ctx context.Context, n *engine.Node, out *llmOutput, expected any, args map[string]any, parent any, set fixtures.Set) string {
+	if g.monty == nil || g.caps == nil {
+		slog.Info("plan: verification skipped — no runner wired", "field", n.Name)
+		return ""
+	}
+	if violation := engine.ValidateScript(out.MontyScript); violation != "" {
+		return "script failed pre-execution validation: " + violation
+	}
+	mockCaps := fixtures.ReplayCapabilities(g.caps, set, g.toolNames)
+	mod, err := g.monty.Compile(out.MontyScript)
+	if err != nil {
+		return fmt.Sprintf("script failed to compile: %v", err)
+	}
+	start := time.Now()
+	raw, _, err := g.monty.Run(ctx, mod, "execute",
+		map[string]any{"args": args, "parent": parent}, mockCaps)
+	rec := session.Record{
+		Call:       "verify",
+		Provider:   g.provider,
+		Field:      n.Name,
+		DurationMS: time.Since(start).Milliseconds(),
+		Result:     raw,
+	}
+	if err != nil {
+		rec.Err = err.Error()
+		g.session.AppendCtx(ctx, rec)
+		return fmt.Sprintf("script raised at runtime: %v", err)
+	}
+	diff := fixtures.Diff(expected, raw, "")
+	if diff != "" {
+		rec.Err = "diff: " + diff
+	}
+	g.session.AppendCtx(ctx, rec)
+	return diff
+}
+
+// buildToolDefs assembles the Anthropic-side tool list the model can
+// call during the GENERATE loop: every upstream MCP tool (with the
+// monty host-name prefix, matching what the script will use) plus
+// the synthetic submit_script tool.
+func (g *Generator) buildToolDefs() []llm.ToolDef {
+	defs := make([]llm.ToolDef, 0, len(g.tools)+1)
+	for _, t := range g.tools {
+		schema := schemaToMap(t)
+		defs = append(defs, llm.ToolDef{
+			Name:        mcpclient.HostNamePrefix + sanitizeToolName(t.Name),
+			Description: t.Description,
+			InputSchema: schema,
+		})
+	}
+	defs = append(defs, llm.ToolDef{
+		Name: submitScriptToolName,
+		Description: `Submit the final monty script that resolves the GraphQL node. ` +
+			`Call this exactly once, when you have explored the upstream tools enough ` +
+			`to write the script confidently. The engine will run the script against ` +
+			`the responses you observed and verify the output matches expected_output.`,
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"monty_script": map[string]any{
+					"type":        "string",
+					"description": "The Python (Monty-on-WASM) script defining `def execute(args, parent):`.",
+				},
+				"expected_output": map[string]any{
+					"description": "The first 1-3 elements of the answer your script will produce given the data you observed during exploration. Used to verify the script. May be a list of objects, a single object, or a scalar — match the script's return type at the top level.",
+				},
+				"io_schema": map[string]any{
+					"description": "Best-effort JSON-Schema-ish description of the script's return shape.",
+				},
+			},
+			"required": []any{"monty_script", "expected_output"},
+		},
+	})
+	return defs
+}
+
+// schemaToMap reads the MCP tool's input schema as a generic
+// map[string]any suitable for embedding in an Anthropic tool
+// definition. Falls back to an empty object schema when the tool
+// has none.
+func schemaToMap(t mcp.Tool) map[string]any {
+	if t.RawInputSchema != nil {
+		var m map[string]any
+		if err := json.Unmarshal(t.RawInputSchema, &m); err == nil {
+			return m
+		}
+	}
+	if t.InputSchema.Type != "" {
+		raw, err := json.Marshal(t.InputSchema)
+		if err == nil {
+			var m map[string]any
+			if json.Unmarshal(raw, &m) == nil {
+				return m
+			}
+		}
+	}
+	return map[string]any{"type": "object", "properties": map[string]any{}}
+}
+
+// sanitizeToolName mirrors the same cleanup mcpclient.sanitize does
+// when building monty host names. Re-implementing here (rather than
+// re-exporting) keeps the import surface small; the rule is trivial.
+func sanitizeToolName(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
+}
+
+// parseSubmitScript extracts the script + expected_output + io_schema
+// from the submit_script tool call's input.
+func parseSubmitScript(input map[string]any) (*llmOutput, any, error) {
+	script, ok := input["monty_script"].(string)
+	if !ok || script == "" {
+		return nil, nil, errors.New("monty_script missing or not a string")
+	}
+	out := &llmOutput{
+		MontyScript: script,
+		IOSchema:    input["io_schema"],
+	}
+	expected, hasExpected := input["expected_output"]
+	if !hasExpected {
+		return nil, nil, errors.New("expected_output missing")
+	}
+	return out, expected, nil
 }
 
 func logUsage(call string, u llm.Usage) {
@@ -909,6 +1318,125 @@ Respond with a single JSON object, no prose, no markdown fence:
       "monty_script": "def execute(args, parent):\n    ...",
       "io_schema":    { "type": "...", ... }   // best-effort JSON-schema-ish description of what the script returns
     }
+`
+
+	return []llm.SystemBlock{
+		{Text: catalog, CacheBreakAfter: true},
+		{Text: preamble, CacheBreakAfter: true},
+	}
+}
+
+// buildGenerateSystemToolUse is the system-prompt builder for the
+// explore-then-submit GENERATE flow. The model is given the catalog
+// as REAL Anthropic tools (added by the loop driver); it calls
+// upstream MCP tools to learn the response shapes, then calls a
+// synthetic submit_script tool to deliver the final script.
+//
+// The script-writing rules are the same as buildGenerateSystem
+// (Monty constraints, output format, etc.) — duplicating them here
+// rather than refactoring keeps the diff focused; if the spike
+// graduates we can extract the shared text.
+//
+// IMPORTANT — DO NOT ADD PROVIDER-SPECIFIC TEXT. Same rule as the
+// legacy prompt: provider knowledge comes from the catalog block
+// (rendered from the live MCP tool list), never hardcoded here.
+func buildGenerateSystemToolUse(catalog string) []llm.SystemBlock {
+	preamble := `You generate Python (Monty-on-WASM) scripts that resolve a single GraphQL node against the upstream MCP server's tools (the host-function catalog below).
+
+You work in two phases:
+
+  1. EXPLORE. Call the upstream tools available to you (each catalog
+     entry is a real callable tool in this conversation) to learn the
+     response shapes. Make as many calls as you need to observe the
+     data your script will navigate. Pay attention to the nesting of
+     wrapper keys, the names of fields, and which IDs need a separate
+     resolver call.
+
+  2. SUBMIT. When you have enough information to write the script,
+     call the synthetic ` + "`submit_script`" + ` tool with the script,
+     the IO schema, and the expected first 1-3 records of the output
+     the script will produce. The engine will then run your script
+     against the responses you observed and verify the output matches
+     your expected_output.
+
+If the verification fails, you'll get one chance to revise.
+
+## The script's runtime contract
+
+The script you submit is invoked by the engine as:
+
+    execute(args, parent)
+
+where:
+  - args   is a dict of the GraphQL field arguments at this node, with values already resolved to Python natives.
+  - parent is None for top-level nodes; for nodes inside a parent's selection set, it is the parent object as the parent's script returned it (a dict, or one element of a list the parent returned).
+
+Your script MUST define ` + "`def execute(args, parent):`" + ` and return:
+  - a list of dicts when the node represents a collection,
+  - a single dict when the node represents one entity,
+  - a scalar (str / int / bool) when the node is a scalar leaf.
+
+The engine handles selection projection: return whichever fields might plausibly be requested at this node — the engine drops anything not asked for in the requested selection set. Do NOT manually filter to the requested fields.
+
+The ONLY external surface available to the script is the host-function catalog below. Do not import requests, urllib, subprocess, os, threading, asyncio, etc. Do not call open(). The Monty sandbox does not provide them.
+
+## Project from parent when possible
+
+If ` + "`parent`" + ` is non-None and the requested fields look like simple projections of values already present in the parent dict, return ` + "`{key: parent.get(key) for key in requested_keys}`" + ` directly. Do NOT call host functions for data the parent already supplied.
+
+## Errors propagate (no try/except)
+
+When a host function raises, let the exception propagate. The engine's retry loop sees the error and gives you a chance to fix the script. Wrapping a tool call in ` + "`try / except`" + ` swallows real errors and is FORBIDDEN — a static check rejects scripts containing those keywords.
+
+Defensive shape handling on a SUCCESSFUL response is fine: ` + "`item.get(key, default)`" + `, ` + "`isinstance(x, dict)`" + `, etc.
+
+## Sandbox Python constraints (verified)
+
+Monty is a forked Python-on-WASM. Most of the language works, but:
+
+ALLOWED:
+  - All built-in types and operations (int, str, list, dict, tuple, set, bool, None)
+  - f-strings:  f"hello {name}"  — use these for formatting
+  - String methods, comprehensions, sorted(), .sort(), isinstance()
+  - import json   — json.dumps, json.loads
+  - import re     — re.search, re.match, re.findall, etc.
+  - import datetime — but ONLY:
+      * datetime.datetime(year, month, day, ...)            — constructor
+      * datetime.datetime.fromisoformat("2024-01-01T...")    — parse ISO 8601
+      * datetime.timedelta(days=N, hours=N, ...)
+      * arithmetic on datetime/timedelta objects
+      * .isoformat(), .strftime() on datetime instances
+
+BANNED (will crash):
+  - "...".format(...)        — use f-strings
+  - "..." %% (a, b)          — use f-strings
+  - datetime.datetime.now()  — use now_iso() / days_ago_iso(n) host helpers
+  - any network, file, subprocess, or threading API
+
+## Time host helpers
+
+  - now_iso()             -> "2026-05-06T14:30:00Z"      RFC 3339, UTC
+  - now_epoch()           -> 1746541800                  unix seconds (int)
+  - days_ago_iso(n=7)     -> "2026-04-29T14:30:00Z"      n days ago, UTC
+  - hours_ago_iso(n=24)   -> "2026-05-05T14:30:00Z"      n hours ago, UTC
+
+When a query passes a numeric time arg like ` + "`days: 7`" + `, pass it directly to days_ago_iso(int(n)) — don't guard with isinstance(x, str).
+
+## Hallucinated field names
+
+The user may request fields that don't exist on any real schema. Treat the field name as an intent signal. If a field has no plausible mapping, return null for it; do not raise.
+
+## Resolve opaque IDs by calling resolver tools you've explored
+
+When the response only carries an opaque identifier (an authorId, ownerId, userId, or similar) but the user asked for a human-readable field (name, displayName, title), look in the catalog for a resolver tool — typically named ` + "`lookup_<kind>_id`" + `, ` + "`get_<kind>_by_id`" + `, etc. Call it during exploration to verify it returns what you expect, then have your script call it too. Cache the resolution within the script (one dict on the local function frame) so iterating a 50-item list doesn't make 50 round-trips.
+
+## What goes in expected_output
+
+When you call ` + "`submit_script`" + `, ` + "`expected_output`" + ` is the SHAPE the engine will compare against. Provide the FIRST 1-3 elements of what your script will return given the data you observed. The engine compares structurally — extra keys in actual output are fine, but missing keys or wrong types fail. Don't include keys you can't predict (e.g. updated timestamps if your script returns the raw upstream value); use null for fields you genuinely expect to be null.
+
+## What goes in io_schema
+
+Best-effort JSON-Schema-ish description of what the script returns. Used by downstream tooling for hints; not strictly enforced.
 `
 
 	return []llm.SystemBlock{

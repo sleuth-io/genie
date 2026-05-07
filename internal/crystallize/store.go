@@ -36,7 +36,22 @@ type Entry struct {
 	CanonicalHash   string          `json:"canonical_hash"`
 	MontyScript     string          `json:"monty_script"`
 	IOSchema        any             `json:"io_schema,omitempty"`
-	CreatedAt       time.Time       `json:"created_at"`
+	// Fixtures captures the (tool, args, response) tuples the LLM
+	// observed during the GENERATE tool-use exploration phase. They
+	// are NOT consulted at runtime — the cached script calls upstream
+	// for fresh data — but are preserved on the entry so that when a
+	// future Regenerate kicks in (e.g. upstream API drift), the LLM
+	// can be primed with the original observed shapes rather than
+	// re-exploring from scratch. Empty for entries written by paths
+	// that don't use tool-use (synthesize, legacy single-turn
+	// GENERATE).
+	Fixtures json.RawMessage `json:"fixtures,omitempty"`
+	// ExpectedOutput is the answer the LLM CLAIMED its script would
+	// produce — used by the verification step to deep-diff the
+	// script's actual output. Stored on success so future
+	// regenerations can pin the same expectation.
+	ExpectedOutput any       `json:"expected_output,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // Alias is the literal-shape-keyed pointer record. Multiple aliases can

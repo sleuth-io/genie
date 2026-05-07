@@ -46,9 +46,82 @@ type Response struct {
 	Usage Usage
 }
 
-// Client is the LLM call surface plan.Generator depends on.
+// Client is the LLM call surface plan.Generator depends on for
+// single-turn calls (NORMALIZE, plain GENERATE).
 type Client interface {
 	Generate(ctx context.Context, system []SystemBlock, userText string) (Response, error)
+}
+
+// ChatClient is the optional multi-turn surface used by GENERATE's
+// tool-use loop. Backends that can drive tool-use rounds (the
+// Anthropic SDK) implement it; backends that can't (the claude CLI
+// in non-interactive mode) don't, and plan.Generator falls back to
+// single-turn Generate.
+//
+// Type-assert to detect support: `cc, ok := client.(ChatClient)`.
+type ChatClient interface {
+	Client
+	Chat(ctx context.Context, req ChatRequest) (ChatResponse, error)
+}
+
+// ToolDef declares a tool the model may call during a Chat turn.
+// The InputSchema is the JSON-Schema description of expected args.
+type ToolDef struct {
+	Name        string
+	Description string
+	InputSchema map[string]any
+}
+
+// ToolUse is one tool call the model emitted in a turn. ID is the
+// model-assigned identifier; the caller pairs it with a ToolResult.
+type ToolUse struct {
+	ID    string
+	Name  string
+	Input map[string]any
+}
+
+// ToolResult is the caller's response to a ToolUse, fed back as a
+// user message on the next Chat turn.
+type ToolResult struct {
+	ToolUseID string
+	Content   string // serialized tool result, typically JSON
+	IsError   bool
+}
+
+// Message is one entry in the multi-turn conversation. Role is
+// "user" or "assistant". A user message carries either Text (plain
+// prompt) or ToolResults (responses to a prior assistant ToolUse
+// turn). An assistant message carries Text and/or ToolUses.
+type Message struct {
+	Role        string
+	Text        string
+	ToolUses    []ToolUse    // assistant only
+	ToolResults []ToolResult // user only
+}
+
+// ChatRequest is one multi-turn LLM invocation. The caller passes
+// the running message history (each Chat returns the new assistant
+// turn; the caller appends tool results and re-invokes for the next
+// round). Tools is the set of catalog tools exposed for this loop.
+type ChatRequest struct {
+	System   []SystemBlock
+	Messages []Message
+	Tools    []ToolDef
+	// ToolChoice constrains the model's choice. Empty/auto = model
+	// decides; "any" = must call some tool; {"type":"tool","name":"X"}
+	// would force a specific tool but isn't currently used.
+	ToolChoice string
+}
+
+// ChatResponse is one assistant turn. StopReason is "end_turn" when
+// the model produced text without calling a tool, "tool_use" when it
+// emitted ToolUses (caller should respond with ToolResults and call
+// Chat again), or "max_tokens" / other on truncation.
+type ChatResponse struct {
+	Text       string
+	ToolUses   []ToolUse
+	Usage      Usage
+	StopReason string
 }
 
 // Backend names returned by Select for logging.

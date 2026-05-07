@@ -412,7 +412,7 @@ func buildProviderBundle(name string, client *mcpclient.Client, monty *runtime.M
 	}
 
 	store := crystallize.NewStore(filepath.Join(cacheRoot, name))
-	gen := plan.NewGenerator(client, store, llmClient, name, sess)
+	gen := plan.NewGenerator(client, store, llmClient, name, sess).WithRunner(monty, caps)
 	ex := engine.NewExecutor(monty, caps, store).WithGenerator(gen)
 
 	return &providerBundle{
