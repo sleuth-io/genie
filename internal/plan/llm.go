@@ -228,23 +228,32 @@ func (g *Generator) synthesizeProjection(n *engine.Node, parent any, rename *eng
 		keys = append(keys, child.Name)
 	}
 
+	// Inline the projection literal in both branches. Monty's
+	// sandboxed Python doesn't expose module-level helpers to
+	// execute()'s scope, so a `_pick` helper would NameError at
+	// runtime — verified.
+	pick := func() string {
+		var b strings.Builder
+		b.WriteString("{")
+		for i, k := range keys {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(&b, "%q: %s.get(%q)", k, "_d", k)
+		}
+		b.WriteString("}")
+		return b.String()
+	}
+	itemPick := strings.ReplaceAll(pick(), "_d", "item")
+	parentPick := strings.ReplaceAll(pick(), "_d", "parent")
+
 	var script strings.Builder
 	script.WriteString("def execute(args, parent):\n")
 	script.WriteString("    if isinstance(parent, list):\n")
-	script.WriteString("        return [_pick(item) for item in parent if isinstance(item, dict)]\n")
+	fmt.Fprintf(&script, "        return [%s for item in parent if isinstance(item, dict)]\n", itemPick)
 	script.WriteString("    if isinstance(parent, dict):\n")
-	script.WriteString("        return _pick(parent)\n")
+	fmt.Fprintf(&script, "        return %s\n", parentPick)
 	script.WriteString("    return None\n")
-	script.WriteString("\n")
-	script.WriteString("def _pick(d):\n")
-	script.WriteString("    return {")
-	for i, k := range keys {
-		if i > 0 {
-			script.WriteString(", ")
-		}
-		fmt.Fprintf(&script, "%q: d.get(%q)", k, k)
-	}
-	script.WriteString("}\n")
 
 	properties := map[string]any{}
 	for _, k := range keys {
@@ -256,6 +265,94 @@ func (g *Generator) synthesizeProjection(n *engine.Node, parent any, rename *eng
 		"synthesized": true,
 	}
 	return script.String(), ioSchema, true
+}
+
+// Regenerate implements engine.ScriptRetryer. Called by the executor
+// when a previously-generated script errors at compile or run time
+// (typically a tool-call returning an upstream constraint violation
+// — e.g. Atlassian's "Unbounded JQL queries are not allowed here").
+//
+// We re-run the GENERATE prompt with the failed script and the
+// verbatim error appended as user-message context so the LLM can
+// adjust. The new script replaces the L2 cache entry — future calls
+// against this canonical hash get the fixed version directly without
+// paying for another retry.
+//
+// One retry per node (the executor caps at one). If the regeneration
+// itself fails or the new script also errors, we surface the
+// original error.
+func (g *Generator) Regenerate(ctx context.Context, n *engine.Node, parent any, prevScript, prevErr string) (string, *engine.NodeRename, error) {
+	// Reload state for this node — we need the canonical schema and
+	// rename that NORMALIZE produced earlier. They're already in
+	// the L2 cache (we wrote them on the first attempt).
+	shape := n.Shape()
+	literalHash := shape.L1Hash()
+	alias, ok, err := g.store.GetAlias(literalHash)
+	if err != nil || !ok {
+		return "", nil, fmt.Errorf("regenerate: no alias for shape %s (was the first attempt persisted?)", literalHash[:12])
+	}
+	entry, ok, err := g.store.GetEntry(alias.CanonicalHash)
+	if err != nil || !ok {
+		return "", nil, fmt.Errorf("regenerate: no L2 entry for canonical %s", alias.CanonicalHash[:12])
+	}
+
+	canon := canonicalSchema{}
+	if entry.CanonicalSchema != nil {
+		_ = json.Unmarshal(entry.CanonicalSchema, &canon)
+	}
+
+	userText, err := buildRetryPrompt(n, parent, &canon, prevScript, prevErr)
+	if err != nil {
+		return "", nil, fmt.Errorf("build retry prompt: %w", err)
+	}
+
+	slog.Info("plan: regenerating after script error",
+		"field", n.Name,
+		"canonical_hash", alias.CanonicalHash[:12],
+		"prev_err", truncate(prevErr, 200))
+
+	resp, err := g.callLLM(ctx, "regenerate", n.Name, g.generateSystem, userText)
+	if err != nil {
+		return "", nil, fmt.Errorf("regenerate llm call: %w", err)
+	}
+	out, err := parseLLMResponse(resp.Text)
+	if err != nil {
+		return "", nil, fmt.Errorf("parse regenerate response: %w", err)
+	}
+	g.metrics.GenerateCalls++
+	g.metrics.GenerateInputTokens += resp.Usage.InputTokens
+	g.metrics.GenerateOutputTokens += resp.Usage.OutputTokens
+
+	// Replace the L2 entry so subsequent calls skip the broken
+	// version. Alias unchanged — same literal-shape → same
+	// canonical hash.
+	entry.MontyScript = out.MontyScript
+	entry.IOSchema = out.IOSchema
+	if err := g.store.PutEntry(*entry); err != nil {
+		slog.Warn("plan: regenerated entry write failed", "err", err)
+	}
+	return out.MontyScript, alias.Rename, nil
+}
+
+// buildRetryPrompt extends the standard GENERATE user prompt with
+// the previous attempt's script and error. The LLM sees the original
+// task plus what just went wrong; the GENERATE system prompt's
+// instructions about output shape stay in force.
+func buildRetryPrompt(n *engine.Node, parent any, canon *canonicalSchema, prevScript, prevErr string) (string, error) {
+	original, err := buildUserPrompt(n, parent, canon)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	b.WriteString(original)
+	b.WriteString("\n\n## Previous attempt failed\n\n")
+	b.WriteString("Your earlier script:\n\n```python\n")
+	b.WriteString(prevScript)
+	b.WriteString("\n```\n\nFailed with:\n\n```\n")
+	b.WriteString(prevErr)
+	b.WriteString("\n```\n\n")
+	b.WriteString("The error message is verbatim from the upstream system; trust the constraint it describes. Generate a corrected script that respects it. Output the same JSON shape (monty_script + io_schema) as before.\n")
+	return b.String(), nil
 }
 
 func joinBlocks(blocks []llm.SystemBlock) string {

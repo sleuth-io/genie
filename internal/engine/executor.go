@@ -33,6 +33,19 @@ type ScriptResolver interface {
 //     script (literal user args → canonical names the script expects);
 //   - applies ChildrenLiteralToCanonical when projecting children of THIS
 //     node from the canonical-keyed parent the script returned.
+//
+// ScriptRetryer is an optional extension of ScriptGenerator. When the
+// monty runtime fails a script (compile or run error — typically a
+// tool-call returning an upstream error like Atlassian's "Unbounded
+// JQL queries are not allowed here"), the executor type-asserts on
+// this interface and gives the generator a single chance to write a
+// fixed script with the error as context. Implementations that don't
+// support retry simply omit Regenerate; the executor falls through
+// to the original error path.
+type ScriptRetryer interface {
+	Regenerate(ctx context.Context, n *Node, parent any, prevScript, prevErr string) (string, *NodeRename, error)
+}
+
 type ScriptGenerator interface {
 	Generate(ctx context.Context, n *Node, parent any) (script string, rename *NodeRename, err error)
 }
@@ -178,14 +191,24 @@ func (e *Executor) resolveNode(
 		return v, nil
 	}
 
+	var raw any
 	mod, err := e.eng.Compile(src)
-	if err != nil {
-		return nil, fmt.Errorf("compile script for %q: %w", n.Name, err)
+	if err == nil {
+		raw, _, err = e.eng.Run(ctx, mod, "execute",
+			map[string]any{"args": argMap, "parent": parent}, e.caps)
 	}
-	raw, _, err := e.eng.Run(ctx, mod, "execute",
-		map[string]any{"args": argMap, "parent": parent}, e.caps)
 	if err != nil {
-		return nil, fmt.Errorf("run script for %q: %w", n.Name, err)
+		// One LLM-driven retry: hand the generator the previous
+		// script + error so it can adjust. The retry path skips
+		// cache, runs a fresh GENERATE call, and replaces the
+		// cached entry on success so future calls get the fixed
+		// version.
+		newSrc, newRename, newRaw, retried := e.tryRetry(ctx, n, parent, argMap, src, err.Error())
+		if !retried {
+			return nil, fmt.Errorf("run script for %q: %w", n.Name, err)
+		}
+		src, rename, raw = newSrc, newRename, newRaw
+		_ = src // retained for clarity; future debug hooks may want it
 	}
 
 	composed, err := e.composeChildren(ctx, n, raw, rename, memo)
@@ -194,6 +217,39 @@ func (e *Executor) resolveNode(
 	}
 	memo[memoKey] = composed
 	return composed, nil
+}
+
+// tryRetry asks the generator (if it supports retry) for a fixed
+// script given the previous script + error, then attempts to compile
+// and run the new script. Returns ok=true with the new (script,
+// rename, result) on success; ok=false leaves the caller to surface
+// the original error. Capped at one retry per node — runaway loops
+// are worse than a clean error.
+func (e *Executor) tryRetry(
+	ctx context.Context,
+	n *Node,
+	parent any,
+	argMap map[string]any,
+	prevScript, prevErr string,
+) (string, *NodeRename, any, bool) {
+	retryer, ok := e.gen.(ScriptRetryer)
+	if !ok {
+		return "", nil, nil, false
+	}
+	newSrc, newRename, err := retryer.Regenerate(ctx, n, parent, prevScript, prevErr)
+	if err != nil {
+		return "", nil, nil, false
+	}
+	mod, err := e.eng.Compile(newSrc)
+	if err != nil {
+		return "", nil, nil, false
+	}
+	raw, _, err := e.eng.Run(ctx, mod, "execute",
+		map[string]any{"args": argMap, "parent": parent}, e.caps)
+	if err != nil {
+		return "", nil, nil, false
+	}
+	return newSrc, newRename, raw, true
 }
 
 // composeChildren walks the selection set on every result element. Lists
