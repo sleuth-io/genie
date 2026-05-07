@@ -109,10 +109,14 @@ type Record struct {
 	Response   string `json:"response,omitempty"`
 	Usage      *Usage `json:"usage,omitempty"`
 
-	// Tool-call events.
-	Tool        string         `json:"tool,omitempty"`
-	ToolArgs    map[string]any `json:"tool_args,omitempty"`
-	ResultBytes int            `json:"result_bytes,omitempty"`
+	// Tool-call events. Result is the full upstream MCP response —
+	// always raw API data that the monty script then shapes before
+	// anything reaches the calling agent, never user-presented data
+	// directly. Tracing requires the full response so an evaluator
+	// can see what the script saw.
+	Tool     string         `json:"tool,omitempty"`
+	ToolArgs map[string]any `json:"tool_args,omitempty"`
+	Result   any            `json:"result,omitempty"`
 
 	// Always populated where it makes sense.
 	Err        string `json:"error,omitempty"`
