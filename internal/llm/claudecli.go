@@ -55,6 +55,9 @@ func (c *claudeCLI) Generate(ctx context.Context, system []SystemBlock, userText
 	if model != "" {
 		args = append(args, "--model", model)
 	}
+	if EffortFromContext(ctx) == EffortDisabled {
+		args = append(args, "--effort", "low")
+	}
 
 	cmd := exec.CommandContext(ctx, c.bin, args...)
 	stdout, err := cmd.StdoutPipe()

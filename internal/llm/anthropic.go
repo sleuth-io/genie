@@ -38,13 +38,20 @@ func (a *anthropicClient) Generate(ctx context.Context, system []SystemBlock, us
 		model = anthropic.Model(DefaultModel)
 	}
 
+	thinking := anthropic.ThinkingConfigParamUnion{
+		OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{},
+	}
+	if EffortFromContext(ctx) == EffortDisabled {
+		thinking = anthropic.ThinkingConfigParamUnion{
+			OfDisabled: &anthropic.ThinkingConfigDisabledParam{},
+		}
+	}
+
 	params := anthropic.MessageNewParams{
 		Model:     model,
 		MaxTokens: 16000,
 		System:    blocks,
-		Thinking: anthropic.ThinkingConfigParamUnion{
-			OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{},
-		},
+		Thinking:  thinking,
 		Messages: []anthropic.MessageParam{
 			anthropic.NewUserMessage(anthropic.NewTextBlock(userText)),
 		},

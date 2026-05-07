@@ -67,6 +67,34 @@ const BackendEnvVar = "GENIE_LLM_BACKEND"
 // its API/CLI invocation. Empty string ⇒ use the backend's default.
 type modelKey struct{}
 
+// effortKey is the context value key for per-call thinking-effort
+// overrides. plan.Generator sets EffortDisabled for NORMALIZE (small
+// structured output, no reasoning needed) and leaves it default for
+// GENERATE. Backends translate to their native equivalent (SDK:
+// Thinking config; CLI: --effort flag).
+type effortKey struct{}
+
+// Effort levels. Empty string ⇒ backend default.
+const (
+	EffortDisabled = "disabled" // SDK: OfDisabled. CLI: --effort low.
+)
+
+// WithEffort attaches a thinking-effort hint to ctx.
+func WithEffort(ctx context.Context, level string) context.Context {
+	if level == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, effortKey{}, level)
+}
+
+// EffortFromContext returns the effort level attached to ctx, or "".
+func EffortFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(effortKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
 // WithModel attaches a model identifier to ctx. Empty s leaves ctx
 // unchanged so callers can branch-free pass through.
 func WithModel(ctx context.Context, s string) context.Context {

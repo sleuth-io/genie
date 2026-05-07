@@ -134,6 +134,12 @@ func (g *Generator) callLLM(ctx context.Context, callType, field string, system 
 	case "normalize":
 		progress.Report(ctx, "Normalizing %q…", field)
 		ctx = llm.WithModel(ctx, g.normalizeModel)
+		// NORMALIZE produces a small, structured-shape JSON object
+		// (canonical schema + rename maps). It's a constraint-
+		// satisfying transformation, not a reasoning task — adaptive
+		// thinking adds latency without measurable accuracy gain.
+		// Hyp-3 (paraphrase fingerprinting) covers this empirically.
+		ctx = llm.WithEffort(ctx, llm.EffortDisabled)
 	case "generate":
 		progress.Report(ctx, "Generating script for %q…", field)
 		ctx = llm.WithModel(ctx, g.generateModel)
@@ -163,6 +169,93 @@ func (g *Generator) callLLM(ctx context.Context, callType, field string, system 
 	}
 	g.session.AppendCtx(ctx, rec)
 	return resp, err
+}
+
+// synthesizeProjection returns a deterministic monty script when n is
+// safe to skip GENERATE for: a non-top-level object selection whose
+// children are all scalar leaves with identity renames. The script
+// projects the requested keys out of the parent dict (or list of
+// dicts) the parent script returned. Returns ok=false if any check
+// fails — caller falls through to the LLM-driven GENERATE path.
+//
+// Why we trust this path:
+//
+//   - NORMALIZE has already run. If the LLM thinks any child name
+//     should canonicalise to something different, the rename map
+//     records a non-identity entry and we bail. The LLM's
+//     canonicalisation is the load-bearing semantic step; we only
+//     skip GENERATE when NORMALIZE confirms there's nothing to
+//     translate.
+//   - For the children that pass, the synthesized script is exactly
+//     what GENERATE would have written: `parent.get(name)` per
+//     scalar key. No reasoning involved on either path.
+//   - Output lands in the L2 cache like any other entry. Indis-
+//     tinguishable from an LLM-generated entry on next replay.
+//
+// What we deliberately don't synthesize:
+//
+//   - Top-level nodes (parent == nil) — they need to invoke MCP
+//     tools; only the LLM knows which.
+//   - Nodes with args — the args might select a different upstream
+//     code path; can't predict from name alone.
+//   - Children with their own selection — recurse normally; the
+//     child's own Generate call will decide whether IT is trivial.
+//   - Non-identity renames — the LLM thinks a translation is needed,
+//     so the script needs the LLM's translation logic.
+func (g *Generator) synthesizeProjection(n *engine.Node, parent any, rename *engine.NodeRename) (string, any, bool) {
+	if parent == nil {
+		return "", nil, false
+	}
+	if len(n.Args) > 0 {
+		return "", nil, false
+	}
+	if len(n.Selection) == 0 {
+		return "", nil, false
+	}
+	keys := make([]string, 0, len(n.Selection))
+	for _, child := range n.Selection {
+		if len(child.Selection) > 0 || len(child.Args) > 0 {
+			return "", nil, false
+		}
+		// NORMALIZE must have explicitly recorded an identity entry for
+		// this child. Missing entry ⇒ we don't know it's safe; fall
+		// through to LLM (whose script handles whatever's actually
+		// there).
+		canon, ok := rename.ChildrenLiteralToCanonical[child.Name]
+		if !ok || canon != child.Name {
+			return "", nil, false
+		}
+		keys = append(keys, child.Name)
+	}
+
+	var script strings.Builder
+	script.WriteString("def execute(args, parent):\n")
+	script.WriteString("    if isinstance(parent, list):\n")
+	script.WriteString("        return [_pick(item) for item in parent if isinstance(item, dict)]\n")
+	script.WriteString("    if isinstance(parent, dict):\n")
+	script.WriteString("        return _pick(parent)\n")
+	script.WriteString("    return None\n")
+	script.WriteString("\n")
+	script.WriteString("def _pick(d):\n")
+	script.WriteString("    return {")
+	for i, k := range keys {
+		if i > 0 {
+			script.WriteString(", ")
+		}
+		fmt.Fprintf(&script, "%q: d.get(%q)", k, k)
+	}
+	script.WriteString("}\n")
+
+	properties := map[string]any{}
+	for _, k := range keys {
+		properties[k] = map[string]any{}
+	}
+	ioSchema := map[string]any{
+		"type":        "object",
+		"properties":  properties,
+		"synthesized": true,
+	}
+	return script.String(), ioSchema, true
 }
 
 func joinBlocks(blocks []llm.SystemBlock) string {
@@ -235,6 +328,37 @@ func (g *Generator) Generate(ctx context.Context, n *engine.Node, parent any) (s
 		Call: "cache_l2", Provider: g.provider, Field: n.Name,
 		Hit: false, Hash: canonicalHash[:12],
 	})
+
+	// Step 4a: short-circuit GENERATE for trivial-extraction nodes
+	// — those whose children are scalar leaves with identity renames
+	// over a known parent. The script we'd otherwise pay the LLM to
+	// write is a deterministic projection; synthesize it directly,
+	// persist as an L2 entry, return.
+	if synth, ioSchema, ok := g.synthesizeProjection(n, parent, rename); ok {
+		slog.Info("plan: synthesized trivial projection",
+			"field", n.Name,
+			"canonical_hash", canonicalHash[:12])
+		g.session.AppendCtx(ctx, session.Record{
+			Call: "synthesize", Provider: g.provider, Field: n.Name,
+			Hash: canonicalHash[:12],
+		})
+		entry := crystallize.Entry{
+			Shape:           shape,
+			Field:           n.Name,
+			CanonicalSchema: canonical,
+			CanonicalHash:   canonicalHash,
+			MontyScript:     synth,
+			IOSchema:        ioSchema,
+		}
+		if err := g.store.PutEntry(entry); err != nil {
+			slog.Warn("plan: L2 entry write failed; replay will regenerate",
+				"field", n.Name, "canonical_hash", canonicalHash[:12], "err", err)
+		}
+		if err := g.store.PutAlias(literalHash, canonicalHash, rename); err != nil {
+			slog.Warn("plan: L1 alias write failed", "err", err)
+		}
+		return synth, rename, nil
+	}
 
 	// Step 4: full generate. Pass the canonical schema so the LLM emits a
 	// canonical-keyed script (other paraphrases reusing this script via L2
