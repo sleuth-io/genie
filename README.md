@@ -16,53 +16,35 @@ Measured against the GitHub MCP server on a representative query:
 | LLM tokens on cache replay | full | **0** | — |
 
 
-## 30 seconds: add Genie to your agent
+## Quickstart
 
 ```bash
 go install github.com/sleuth-io/genie/cmd/genie@latest
 ```
 
-Add the MCP servers you want Genie to front. No config file to edit — `genie mcp add` writes it for you:
+Add the MCP servers you want Genie to front:
 
 ```bash
-# A stdio MCP server (env-var auth)
-genie mcp add github github-mcp-server stdio \
-  --env 'GITHUB_PERSONAL_ACCESS_TOKEN=${env:GITHUB_TOKEN}' \
-  --description 'GitHub repos, PRs, issues'
+# HTTP/SSE with OAuth — opens a browser, finishes the well-known dance,
+# stores tokens in your OS keychain. One command, then you're done.
+genie mcp add -n linear -u https://mcp.linear.app/sse
 
-# An HTTP/SSE MCP server with OAuth — Genie pops a browser, finishes the
-# RFC 8414 + RFC 7591 dance, stores tokens in your OS keychain.
-genie mcp add linear https://mcp.linear.app/sse --type sse --scope read --scope write
-
-# Anything you can paste from Claude Code's .mcp.json works verbatim:
-genie mcp add --json '{"name":"atlassian","url":"https://mcp.atlassian.com/v1"}'
-
-# Inspect what's wired up:
-genie mcp list
-genie auth list
+# stdio
+genie mcp add -n github -c "github-mcp-server stdio" \
+  --env 'GITHUB_PERSONAL_ACCESS_TOKEN=${env:GITHUB_TOKEN}'
 ```
 
-Tokens land in your OS keychain (Keychain on macOS, Secret Service on Linux, Credential Manager on Windows); refresh is automatic. To re-authorize manually, run `genie auth <provider>`. The config itself lives at `~/.config/genie/config.json` if you ever want to edit it directly — it's the same JSON shape Claude Code uses, so you can paste yours in.
-
-Then point your agent at Genie:
+Point your agent (Claude Code, Claude Desktop, etc.) at Genie:
 
 ```json
 {
   "mcpServers": {
-    "genie": {
-      "command": "genie",
-      "args": ["serve"],
-      "env": {
-        "ANTHROPIC_API_KEY": "${env:ANTHROPIC_API_KEY}"
-      }
-    }
+    "genie": { "command": "genie", "args": ["serve"] }
   }
 }
 ```
 
-Your agent's LLM now sees two tools: `run_query(provider, query)` for resolution and `list_providers()` for introspection. The `provider` arg is one of the keys you put in `mcpServers` (above: `github`, `linear`).
-
-**What your agent's LLM does:** writes a GraphQL-shaped query string and passes it to `run_query`. The field names don't have to match any real schema — they're treated as intent signals. So either of these is valid input:
+Your agent's LLM now sees `run_query(provider, query)` and `list_providers()`. It writes GraphQL-shaped intent — invented field names are fine — and Genie maps it to whatever the upstream MCP server actually returns:
 
 ```graphql
 { pull_requests(owner: "anthropics", repo: "anthropic-sdk-python", state: "open") { title number author { login } } }
@@ -71,111 +53,39 @@ Your agent's LLM now sees two tools: `run_query(provider, query)` for resolution
 { openPRs(owner: "anthropics", repo: "anthropic-sdk-python") { title num author { username } } }
 ```
 
-Both resolve to the same cached plan. The first call for a new query shape pays an LLM-generation cost; every subsequent call — including paraphrases like the second example — hits the cache and pays nothing.
+Both phrasings resolve to the same cached plan. The first call pays the LLM-generation cost; every subsequent call — including paraphrases — hits the cache and pays nothing.
 
-(If your agent takes natural-language input from a human, the human→GraphQL translation happens in the *caller's* LLM, not in Genie. That's a feature: agents are good at writing GraphQL-shaped intent; they're bad at parsing 1700-token API responses. We do the second half.)
+## How it works
 
-## What it does
+1. **Schemaless GraphQL parse.** The query becomes a node tree. Field names are treated as intent, not validated against any schema.
+2. **Two-level cache** under `~/.cache/genie/crystallized/<provider>/`:
+   - **L1** keyed by literal-shape hash → points at an L2 entry plus per-query rename info.
+   - **L2** keyed by **canonical-shape hash** (LLM-normalised) holding the resolution script and canonical I/O contract.
+3. **L1 hit** → load script, apply cached rename, run. Zero LLM tokens.
+4. **L1 miss → small NORMALIZE call** produces a canonical hash + rename. **L2 hit** → reuse the script, write an L1 alias for next time. **L2 miss → full GENERATE call** emits a Python (Monty/WASM) script that resolves this intent against the upstream MCP server's tools. Cache it.
+5. **Engine** runs the script in a sandbox, applies the per-query rename to the canonical-keyed output, recurses into child nodes (each may trigger its own L1/L2/GEN cycle).
 
-- **Front many MCP servers, expose two tools.** Configure as many upstream MCP servers as you want; your agent's LLM still only sees `run_query` and `list_providers`. No more "load 38 schemas to call one of them."
-- **Pre-shaped responses.** Genie returns only the fields your agent asked for. Raw API responses (often 1.5K+ tokens of metadata) never enter your agent's context.
-- **Plan caching, not response caching.** The *resolution plan* is cached by canonical intent — the data stays fresh, the planning cost amortises. Paraphrases of the same question hit the same cached plan.
-- **Hallucination-tolerant input.** Your agent can ask in any GraphQL-shaped phrasing, including invented field names — Genie maps them to the real underlying fields. *Make a wish, get the data.*
-
-## Three modes
-
-### Mode 1 — sidecar / MCP server (recommended; works today)
-
-What the quickstart above describes. Your agent spawns `genie serve` as a subprocess, sees `run_query` + `list_providers`. Cache lives at `~/.cache/genie/crystallized/` (or `$GENIE_CACHE_DIR`), shared across projects so paraphrased queries from any working directory hit the same plans.
-
-### Mode 2 — Go library (in-process)
-
-```go
-import "github.com/sleuth-io/genie/pkg/genie"
-
-g, err := genie.New(ctx, genie.Config{
-    Providers:    []genie.Provider{genie.GitHubMCP(token)},
-    AnthropicKey: os.Getenv("ANTHROPIC_API_KEY"),
-})
-defer g.Close()
-
-result, err := g.Query(ctx, genie.QueryRequest{
-    Provider: "github",
-    Query:    `{ pull_requests(state: "open") { title number author { login } } }`,
-})
-```
-
-For Go agent frameworks that want tighter integration without a subprocess. Pass `Providers` programmatically (as above) or set `ConfigPath` to point at a JSON file in the same shape as the quickstart config.
-
-### Mode 3 — CLI (debugging, scripting, eval)
-
-```bash
-genie query --provider github '{ viewer { login } }'
-genie eval --cold --replay     # run the bundled eval set
-```
-
-## Subcommands
-
-Provider management:
-
-- `genie mcp add <name> <url|command> [args...]` — register an MCP server. URL → http/sse transport (auto-runs OAuth flow); command → stdio.
-- `genie mcp add --json '{...}'` — same, fed an entry from Claude Code's `.mcp.json` verbatim.
-- `genie mcp list` — show configured providers.
-- `genie mcp remove <name>` — drop a provider (also clears its stored credentials unless `--keep-credentials`).
-
-Auth:
-
-- `genie auth <provider>` — re-run the OAuth browser flow for an http/sse provider.
-- `genie auth list` — show which providers are authenticated and when tokens expire.
-- `genie auth logout <provider>` — drop stored credentials for one provider.
-
-Runtime:
-
-- `genie serve` — start MCP stdio server exposing `run_query` + `list_providers`.
-- `genie query [--provider NAME] "<graphql>"` — resolve one query, print JSON.
-- `genie eval [--cold] [--replay] [--hypothesis-3]` — run the curated and adversarial sets, print metrics.
-
-## Authentication
-
-Genie supports stdio MCP servers (env-var auth, e.g. `GITHUB_PERSONAL_ACCESS_TOKEN`) and HTTP/SSE servers with OAuth 2.1 + PKCE. The OAuth flow uses RFC 8414 + RFC 9728 well-known discovery and RFC 7591 dynamic client registration, so no per-provider client setup is needed for compliant servers.
-
-Tokens are stored in the OS keychain by default (override with `GENIE_AUTH_BACKEND=file` for headless boxes without a keyring). Refresh tokens are used automatically when access tokens expire; on refresh failure or token revocation, the next request re-runs the browser flow.
-
-## Configuration
-
-- Config: `$GENIE_CONFIG` or `~/.config/genie/config.json` (per `os.UserConfigDir`).
-- Cache: `$GENIE_CACHE_DIR` or `~/.cache/genie/crystallized/` (per `os.UserCacheDir`). Each provider gets its own subdirectory.
-- Env vars in config use `${env:VAR}` interpolation. Unset variables are a hard error so a typo can't silently spawn an MCP server with an empty token.
+The "rename" step is what lets `commits { hash }` work when GitHub returns `sha` — the GENERATE call writes the script to canonical names, and the per-query alias remaps the output for the caller.
 
 ## LLM backend
 
-Plan generation needs an LLM. Genie picks a backend automatically:
+Plan generation needs an LLM. Genie picks one automatically:
 
-1. `ANTHROPIC_API_KEY` set → call the Anthropic API directly.
-2. Otherwise, if the `claude` CLI is on `PATH` → shell out to it. Useful when Genie is running under Claude Code; no API key required.
+1. `ANTHROPIC_API_KEY` set → Anthropic API directly.
+2. Otherwise, `claude` CLI on PATH → shell out to it. Useful when Genie runs under Claude Code; no API key required.
 3. Otherwise → error.
 
-Pin a specific backend with `GENIE_LLM_BACKEND=anthropic-sdk` or `GENIE_LLM_BACKEND=claude-cli`.
+Pin one with `GENIE_LLM_BACKEND=anthropic-sdk|claude-cli`.
 
-## Layout
+## Authentication
 
-- `cmd/genie/` — entry points (`query`, `serve`, `eval`)
-- `pkg/genie/` — public Go API (`New`, `Config`, `Query`, `ListProviders`, …)
-- `internal/config/` — config-file parser (`mcpServers` schema + env interpolation)
-- `internal/auth/` — OAuth flow + keychain/file-backed token vault
-- `internal/providers/` — multi-provider lifecycle (spawn, route, close)
-- `internal/runtime/` — embedded monty (Python-on-WASM via wazero); script execution sandbox
-- `internal/engine/` — schemaless GraphQL parser, node-shape hashing, executor
-- `internal/plan/` — Anthropic SDK calls for plan generation + canonical-shape normalisation
-- `internal/crystallize/` — flat-JSON cache (L1 alias + L2 entry, namespaced per provider)
-- `internal/mcpclient/` — MCP stdio client + bridge from script-side host functions to MCP tool calls
-- `internal/mcpserver/` — exposes `run_query` + `list_providers` to upstream agents
-- `internal/eval/` — eval harness + ground-truth fixtures + FR-7 metrics
-- `eval/intents.yaml`, `eval/adversarial.yaml` — curated test sets
+stdio servers authenticate with env vars (`--env`). HTTP/SSE servers use OAuth 2.1 + PKCE with RFC 8414/9728 well-known discovery and RFC 7591 dynamic client registration — no per-provider client setup needed. `genie mcp add` opens the browser flow inline; tokens land in your OS keychain (Keychain / Secret Service / Credential Manager). Refresh is automatic; on revocation the next request re-runs the flow.
+
+`genie auth <provider>` re-runs the flow manually. `genie auth list` shows status. `GENIE_AUTH_BACKEND=file` falls back to disk for headless boxes without a keyring.
 
 ## Status
 
-Working spike with measured wins on a curated GitHub eval set. **Not production-grade** — single-tenant, no governance layer. Multi-provider routing works today; failed provider spawns are logged and dropped, not fatal. Lazy provider spawn, health checks, and OAuth-flow handoffs are deferred.
+Working spike with measured wins on a curated GitHub eval set. **Not production-grade** — single-tenant, no governance layer. Multi-provider routing works; failed providers are logged and dropped, not fatal. Lazy spawn, health checks, and OAuth-flow handoffs are deferred.
 
 ## Why this and not Portkey / LiteLLM / GPTCache
 

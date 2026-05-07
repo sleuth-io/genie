@@ -88,10 +88,10 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `genie — smart MCP client for agents
 
 Usage:
-  genie mcp add <name> <url|command> [args...]
-                            add a provider to your config (HTTP runs auth)
-  genie mcp list            list configured providers
-  genie mcp remove <name>   drop a provider
+  genie mcp add -n NAME -u URL                add an http/sse provider (auto-auth)
+  genie mcp add -n NAME -c "CMD [ARGS...]"    add a stdio provider
+  genie mcp list                              list configured providers
+  genie mcp remove NAME                       drop a provider
   genie auth <provider>     re-run the OAuth flow for an http/sse provider
   genie auth list           show auth status for each provider
   genie query "<graphql>"   resolve one query, print JSON

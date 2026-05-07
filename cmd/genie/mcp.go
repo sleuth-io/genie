@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -18,9 +17,9 @@ import (
 // runMCP implements `genie mcp <subcommand>`, the config-edit surface
 // users interact with instead of editing config.json by hand.
 //
-//	genie mcp add <name> <url|command> [args...]
-//	genie mcp add --json '<json>'
-//	genie mcp remove <name>
+//	genie mcp add --name NAME (--url URL | --command "CMD [ARGS...]")
+//	genie mcp add --json '{"name": "...", "url": "..."}'
+//	genie mcp remove NAME
 //	genie mcp list
 //
 // `add` for an HTTP URL automatically runs the OAuth flow once the
@@ -50,7 +49,16 @@ func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 func runMCPAdd(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("mcp add", flag.ContinueOnError)
 	configPath := fs.String("config", "", "override config path")
-	jsonStr := fs.String("json", "", "register a provider from a JSON object (mutually exclusive with positional args)")
+	jsonStr := fs.String("json", "", "register a provider from a JSON object")
+
+	var name, urlFlag, commandFlag string
+	fs.StringVar(&name, "name", "", "provider name (required unless using --json)")
+	fs.StringVar(&name, "n", "", "shorthand for --name")
+	fs.StringVar(&urlFlag, "url", "", "HTTP/SSE provider URL")
+	fs.StringVar(&urlFlag, "u", "", "shorthand for --url")
+	fs.StringVar(&commandFlag, "command", "", "stdio provider command (with args, whitespace-split)")
+	fs.StringVar(&commandFlag, "c", "", "shorthand for --command")
+
 	transportType := fs.String("type", "", "force transport: http|sse|stdio (default: inferred)")
 	description := fs.String("description", "", "human-readable description (shown in list_providers)")
 	noAuth := fs.Bool("no-auth", false, "skip the browser OAuth flow after adding (run `genie auth <name>` later)")
@@ -59,16 +67,9 @@ func runMCPAdd(ctx context.Context, args []string) error {
 	fs.Var(&envFlags, "env", "child-process env var, KEY=VALUE (repeatable)")
 	fs.Var(&headerFlags, "header", "HTTP header, KEY=VALUE (repeatable)")
 	fs.Var(&scopeFlags, "scope", "OAuth scope to request (repeatable)")
-
-	// Allow flags to follow positionals (e.g. `genie mcp add github
-	// github-mcp-server stdio --env KEY=VAL`) by splitting at the
-	// first arg that starts with "-". Subprocess command args that
-	// start with "-" must be quoted under a `--` separator.
-	positional, flagArgs := splitPositional(args)
-	if err := fs.Parse(flagArgs); err != nil {
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	rest := positional
 
 	path, err := config.ResolvePath(*configPath)
 	if err != nil {
@@ -79,7 +80,6 @@ func runMCPAdd(ctx context.Context, args []string) error {
 		return err
 	}
 
-	var name string
 	var prov config.ProviderConfig
 
 	switch {
@@ -97,16 +97,21 @@ func runMCPAdd(ctx context.Context, args []string) error {
 		}
 		name = raw.Name
 		prov = raw.ProviderConfig
-	case len(rest) >= 2:
-		name = rest[0]
-		target := rest[1]
-		if looksLikeURL(target) {
-			prov = config.ProviderConfig{URL: target}
-		} else {
-			prov = config.ProviderConfig{Command: target, Args: rest[2:]}
+	case urlFlag != "" && commandFlag != "":
+		return errors.New("--url and --command are mutually exclusive")
+	case urlFlag != "":
+		if name == "" {
+			return errors.New("--name is required")
 		}
+		prov = config.ProviderConfig{URL: urlFlag}
+	case commandFlag != "":
+		if name == "" {
+			return errors.New("--name is required")
+		}
+		parts := strings.Fields(commandFlag)
+		prov = config.ProviderConfig{Command: parts[0], Args: parts[1:]}
 	default:
-		return errors.New(`usage: genie mcp add <name> <url|command> [args...]
+		return errors.New(`usage: genie mcp add --name NAME (--url URL | --command "CMD [ARGS...]")
        genie mcp add --json '{"name": "...", "url": "..."}'`)
 	}
 
@@ -166,7 +171,7 @@ func runMCPRemove(args []string) error {
 	}
 	rest := fs.Args()
 	if len(rest) < 1 {
-		return errors.New(`usage: genie mcp remove <name>`)
+		return errors.New(`usage: genie mcp remove NAME`)
 	}
 	name := rest[0]
 
@@ -212,7 +217,7 @@ func runMCPList(args []string) error {
 		return err
 	}
 	if len(cfg.MCPServers) == 0 {
-		fmt.Printf("No providers configured. Add one with `genie mcp add <name> <url|command>`.\n")
+		fmt.Printf("No providers configured. Add one with `genie mcp add --name NAME --url URL`.\n")
 		return nil
 	}
 
@@ -236,33 +241,6 @@ func runMCPList(args []string) error {
 	}
 	fmt.Printf("\nconfig: %s\n", path)
 	return nil
-}
-
-// splitPositional separates positional args from flag args. Args
-// starting with "-" are treated as the start of the flag block; the
-// special token "--" terminates positionals explicitly so subprocess
-// command args that legitimately start with "-" can survive.
-func splitPositional(args []string) (positional, flagArgs []string) {
-	for i, a := range args {
-		if a == "--" {
-			return args[:i], args[i+1:]
-		}
-		if strings.HasPrefix(a, "-") {
-			return args[:i], args[i:]
-		}
-	}
-	return args, nil
-}
-
-func looksLikeURL(s string) bool {
-	if !strings.Contains(s, "://") {
-		return false
-	}
-	u, err := url.Parse(s)
-	if err != nil {
-		return false
-	}
-	return u.Scheme == "http" || u.Scheme == "https"
 }
 
 func parseKVPairs(in []string, flag string) map[string]string {
