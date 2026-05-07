@@ -621,18 +621,81 @@ type llmOutput struct {
 // We instruct the model to return JSON only, but the SDK still returns
 // plain text — so we parse defensively, allowing for an optional code-fence
 // wrapper (```json ... ```).
+//
+// On strict-parse failure, retry with literal control chars inside string
+// values escaped. The model occasionally emits a real newline/CR/tab inside
+// the monty_script string value (technically invalid JSON per RFC 8259 §7,
+// but a frequent enough output mode that the retry path can't afford to
+// die on it — losing the regenerate response throws away a good script).
 func parseLLMResponse(text string) (*llmOutput, error) {
 	body := strings.TrimSpace(text)
 	body = stripCodeFence(body)
 
 	var out llmOutput
-	if err := json.Unmarshal([]byte(body), &out); err != nil {
-		return nil, fmt.Errorf("unmarshal: %w", err)
+	err := json.Unmarshal([]byte(body), &out)
+	if err != nil {
+		fixed := escapeUnescapedControlsInJSONStrings(body)
+		err = json.Unmarshal([]byte(fixed), &out)
+		if err != nil {
+			return nil, fmt.Errorf("unmarshal: %w", err)
+		}
 	}
 	if out.MontyScript == "" {
 		return nil, errors.New("missing monty_script field")
 	}
 	return &out, nil
+}
+
+// escapeUnescapedControlsInJSONStrings walks the JSON body and replaces
+// any literal newline / carriage return / tab that appears INSIDE a string
+// value with its proper JSON escape. Outside string values these characters
+// are legal whitespace and are passed through unchanged.
+//
+// The walk tracks string-boundary state via a single boolean and respects
+// backslash escapes — when a backslash appears inside a string, the next
+// character is consumed verbatim so an already-escaped quote doesn't
+// confuse the parser.
+//
+// Bytes outside the ASCII range are passed through unchanged; the JSON
+// spec only flags chars < 0x20 inside strings, and runes are rebuilt at
+// unmarshal time.
+func escapeUnescapedControlsInJSONStrings(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 16)
+	inString := false
+	escapeNext := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !inString {
+			if c == '"' {
+				inString = true
+			}
+			b.WriteByte(c)
+			continue
+		}
+		if escapeNext {
+			b.WriteByte(c)
+			escapeNext = false
+			continue
+		}
+		switch c {
+		case '\\':
+			escapeNext = true
+			b.WriteByte(c)
+		case '"':
+			inString = false
+			b.WriteByte(c)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 func stripCodeFence(s string) string {
