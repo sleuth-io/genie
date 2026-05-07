@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/sleuth-io/genie/internal/config"
@@ -116,11 +117,14 @@ type ProviderInfo = providers.Info
 // Genie is the top-level instance. Construct with New, query with
 // Query, and tear down with Close. Safe for concurrent use.
 type Genie struct {
-	registry  *providers.Registry
-	monty     *runtime.MontyEngine
-	llm       llm.Client
-	cacheRoot string
-	bundles   map[string]*providerBundle
+	registry   *providers.Registry
+	monty      *runtime.MontyEngine
+	llm        llm.Client
+	cacheRoot  string
+	configPath string // empty when Providers were passed programmatically (no reload source)
+
+	mu      sync.RWMutex
+	bundles map[string]*providerBundle
 }
 
 // providerBundle is the per-provider engine state. Built once per
@@ -142,7 +146,7 @@ func New(ctx context.Context, cfg Config) (*Genie, error) {
 		return nil, err
 	}
 
-	internalCfg, err := buildInternalConfig(cfg)
+	internalCfg, configPath, err := buildInternalConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -173,12 +177,57 @@ func New(ctx context.Context, cfg Config) (*Genie, error) {
 	}
 
 	return &Genie{
-		registry:  registry,
-		monty:     monty,
-		llm:       llmClient,
-		cacheRoot: cacheRoot,
-		bundles:   bundles,
+		registry:   registry,
+		monty:      monty,
+		llm:        llmClient,
+		cacheRoot:  cacheRoot,
+		configPath: configPath,
+		bundles:    bundles,
 	}, nil
+}
+
+// Reload re-reads the config from the path used at construction,
+// diffs it against the live registry, and applies the delta:
+// adds new providers, drops removed ones, replaces those whose
+// entry changed. In-flight queries against a removed/replaced
+// provider keep working until they finish.
+//
+// Returns an error if Genie was constructed with an explicit
+// Providers slice (no config-file source to reload from).
+func (g *Genie) Reload(ctx context.Context) error {
+	if g.configPath == "" {
+		return fmt.Errorf("reload requires a ConfigPath; this Genie was built from an explicit Providers slice")
+	}
+	cfg, err := config.Load(g.configPath)
+	if err != nil {
+		return err
+	}
+	if err := g.registry.Reload(ctx, cfg); err != nil {
+		return err
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	newBundles := make(map[string]*providerBundle, len(g.registry.Names()))
+	for _, name := range g.registry.Names() {
+		client, _ := g.registry.Get(name)
+		if existing, ok := g.bundles[name]; ok && existing.client == client {
+			newBundles[name] = existing // unchanged — reuse so plan-Generator metrics survive
+			continue
+		}
+		newBundles[name] = buildProviderBundle(name, client, g.monty, g.llm, g.cacheRoot)
+	}
+	g.bundles = newBundles
+	return nil
+}
+
+// ConfigPath returns the resolved config-file path Genie loads from,
+// or "" if Genie was built from an explicit Providers slice. Useful
+// for callers that want to set up an fsnotify watcher (see
+// WatchConfig).
+func (g *Genie) ConfigPath() string {
+	return g.configPath
 }
 
 // Query resolves a GraphQL-shaped query against the named provider.
@@ -192,7 +241,9 @@ func (g *Genie) Query(ctx context.Context, req QueryRequest) (*Result, error) {
 		return nil, fmt.Errorf("query is required")
 	}
 
+	g.mu.RLock()
 	bundle, ok := g.bundles[req.Provider]
+	g.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("unknown provider %q (known: %v)", req.Provider, g.registry.Names())
 	}
@@ -246,6 +297,8 @@ func (g *Genie) List() []ProviderInfo {
 // the eval harness need direct access; agent integrations should use
 // Query instead.
 func (g *Genie) ExecutorFor(provider string) (*engine.Executor, bool) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	b, ok := g.bundles[provider]
 	if !ok {
 		return nil, false
@@ -256,6 +309,8 @@ func (g *Genie) ExecutorFor(provider string) (*engine.Executor, bool) {
 // GeneratorFor returns the per-provider plan Generator (for the
 // hypothesis-3 NormalizeOnly path used by the eval harness).
 func (g *Genie) GeneratorFor(provider string) (*plan.Generator, bool) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	b, ok := g.bundles[provider]
 	if !ok {
 		return nil, false
@@ -309,14 +364,15 @@ func buildProviderBundle(name string, client *mcpclient.Client, monty *runtime.M
 }
 
 // buildInternalConfig converts the public Config into the internal
-// config.Config shape. If Providers are supplied, they win; else load
-// from ConfigPath (or the default path).
-func buildInternalConfig(cfg Config) (*config.Config, error) {
+// config.Config shape and returns the file path it was loaded from
+// (empty when Providers were supplied programmatically — Reload
+// can't operate on those).
+func buildInternalConfig(cfg Config) (*config.Config, string, error) {
 	if len(cfg.Providers) > 0 {
 		out := &config.Config{MCPServers: make(map[string]config.ProviderConfig, len(cfg.Providers))}
 		for _, p := range cfg.Providers {
 			if p.Name == "" {
-				return nil, fmt.Errorf("provider with empty Name")
+				return nil, "", fmt.Errorf("provider with empty Name")
 			}
 			out.MCPServers[p.Name] = config.ProviderConfig{
 				Command:     p.Command,
@@ -325,12 +381,16 @@ func buildInternalConfig(cfg Config) (*config.Config, error) {
 				Description: p.Description,
 			}
 		}
-		return out, nil
+		return out, "", nil
 	}
 
 	path, err := config.ResolvePath(cfg.ConfigPath)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return config.Load(path)
+	loaded, err := config.Load(path)
+	if err != nil {
+		return nil, "", err
+	}
+	return loaded, path, nil
 }

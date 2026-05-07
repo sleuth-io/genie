@@ -138,16 +138,13 @@ func runMCPAdd(ctx context.Context, args []string) error {
 	if _, exists := cfg.MCPServers[name]; exists && !*force {
 		return fmt.Errorf("provider %q already exists; pass --force to overwrite", name)
 	}
-	cfg.MCPServers[name] = prov
-	if err := config.Save(path, cfg); err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "✓ Added provider %q (%s) to %s\n", name, prov.TransportType(), path)
 
-	// For HTTP/SSE providers, immediately run the auth flow so a
-	// single `mcp add` call ends with everything wired up. Skip if
-	// --no-auth was passed (e.g. for non-OAuth HTTP servers fronted
-	// by a static API key in headers).
+	// Run the OAuth flow BEFORE saving the config. A live `genie
+	// serve` watches config.json and reloads on change; if we saved
+	// first, the reload would race the flow (both processes pop a
+	// browser, both wait on the callback). Auth-then-save means the
+	// reload sees a config entry whose token is already in the
+	// vault and connects without a second flow.
 	if prov.IsHTTP() && !*noAuth && len(prov.Headers) == 0 {
 		fmt.Fprintf(os.Stderr, "Authorizing %q…\n", name)
 		if err := auth.Run(ctx, auth.FlowConfig{
@@ -156,9 +153,15 @@ func runMCPAdd(ctx context.Context, args []string) error {
 			Scopes:       prov.Scopes,
 			Vault:        auth.Open(),
 		}); err != nil {
-			fmt.Fprintf(os.Stderr, "  (auth flow failed: %v — run `genie auth %s` later to retry)\n", err, name)
+			return fmt.Errorf("auth flow: %w (config not saved; rerun `genie mcp add` to retry)", err)
 		}
 	}
+
+	cfg.MCPServers[name] = prov
+	if err := config.Save(path, cfg); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "✓ Added provider %q (%s) to %s\n", name, prov.TransportType(), path)
 	return nil
 }
 

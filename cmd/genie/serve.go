@@ -18,6 +18,10 @@ import (
 // Desktop, Claude Code, mcp-inspector, or any MCP client.
 //
 // stdio is the only transport for v1. HTTP/SSE comes later.
+//
+// Hot-reload: a goroutine watches the config file and calls
+// Genie.Reload on changes, so `genie mcp add` from another shell
+// surfaces in this serve without a restart.
 func runServe(ctx context.Context, _ []string) error {
 	g, err := genie.New(ctx, genie.Config{
 		AnthropicKey: os.Getenv("ANTHROPIC_API_KEY"),
@@ -26,6 +30,14 @@ func runServe(ctx context.Context, _ []string) error {
 		return err
 	}
 	defer func() { _ = g.Close() }()
+
+	if g.ConfigPath() != "" {
+		go func() {
+			if err := g.WatchConfig(ctx); err != nil {
+				slog.Warn("config watcher exited", "err", err)
+			}
+		}()
+	}
 
 	runner := func(ctx context.Context, provider, query string) (map[string]any, error) {
 		return g.QueryMap(ctx, provider, query)

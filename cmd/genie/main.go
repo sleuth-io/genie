@@ -13,16 +13,14 @@ package main
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 
 	"github.com/sleuth-io/genie/internal/buildinfo"
+	"github.com/sleuth-io/genie/internal/logger"
 )
 
 func main() {
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	})))
+	logger.SetDefault()
 
 	if len(os.Args) < 2 {
 		usage()
@@ -57,7 +55,8 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil {
-		slog.Error("command failed", "cmd", cmd, "err", err)
+		logger.Get().Error("command failed", "cmd", cmd, "err", err)
+		fmt.Fprintf(os.Stderr, "genie: %v\n", err)
 		os.Exit(1)
 	}
 }

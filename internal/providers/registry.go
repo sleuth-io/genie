@@ -38,11 +38,12 @@ type Info struct {
 // Get / List are safe for concurrent use; Close must be called from one
 // goroutine, after no further calls are in flight.
 type Registry struct {
-	mu      sync.RWMutex
-	clients map[string]*mcpclient.Client
-	info    map[string]Info
-	vault   auth.Vault
-	cfg     *config.Config
+	mu       sync.RWMutex
+	clients  map[string]*mcpclient.Client
+	info     map[string]Info
+	entries  map[string]config.ProviderConfig
+	vault    auth.Vault
+	reloadMu sync.Mutex // serialises Reload calls
 }
 
 // NewRegistry connects to one MCP server per configured provider and
@@ -56,8 +57,8 @@ func NewRegistry(ctx context.Context, cfg *config.Config) (*Registry, error) {
 	r := &Registry{
 		clients: make(map[string]*mcpclient.Client, len(cfg.MCPServers)),
 		info:    make(map[string]Info, len(cfg.MCPServers)),
+		entries: make(map[string]config.ProviderConfig, len(cfg.MCPServers)),
 		vault:   auth.Open(),
-		cfg:     cfg,
 	}
 
 	for name, prov := range cfg.MCPServers {
@@ -68,12 +69,159 @@ func NewRegistry(ctx context.Context, cfg *config.Config) (*Registry, error) {
 		}
 		r.clients[name] = c
 		r.info[name] = Info{Name: name, Description: prov.Description}
+		r.entries[name] = prov
 		slog.Info("provider ready",
 			"provider", name,
 			"transport", prov.TransportType(),
 			"tools", len(c.Tools()))
 	}
 	return r, nil
+}
+
+// Reload diffs newCfg against the current registry state and applies
+// the delta: open new providers, close removed ones, replace ones
+// whose config changed. Connections happen outside the registry lock
+// (an OAuth flow can take minutes); only the swap is exclusive.
+//
+// Reload calls are serialised against each other but not against
+// Get/List/Names/Close. In-flight queries against a provider that's
+// being replaced or removed retain their *mcpclient.Client reference;
+// Close fires after they return (the registry's contract is "Close
+// when no further calls are in flight against the closing provider"
+// — for replace+remove, Reload waits until the swap before closing,
+// so a query that picked up the old client just before the swap
+// keeps working until completion).
+func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
+	r.reloadMu.Lock()
+	defer r.reloadMu.Unlock()
+
+	r.mu.RLock()
+	currentEntries := make(map[string]config.ProviderConfig, len(r.entries))
+	for k, v := range r.entries {
+		currentEntries[k] = v
+	}
+	r.mu.RUnlock()
+
+	toAdd, toRemove, toReplace := diffEntries(currentEntries, newCfg.MCPServers)
+	if len(toAdd) == 0 && len(toRemove) == 0 && len(toReplace) == 0 {
+		return nil
+	}
+
+	// Open new connections OUTSIDE the lock — OAuth flows can block
+	// for minutes; meanwhile Get/List remain available.
+	connected := make(map[string]*mcpclient.Client)
+	for name, prov := range toAdd {
+		c, err := r.connect(ctx, name, prov)
+		if err != nil {
+			slog.Warn("reload: provider connect failed; skipping", "provider", name, "err", err)
+			continue
+		}
+		connected[name] = c
+		slog.Info("reload: provider added",
+			"provider", name,
+			"transport", prov.TransportType(),
+			"tools", len(c.Tools()))
+	}
+	for name, prov := range toReplace {
+		c, err := r.connect(ctx, name, prov)
+		if err != nil {
+			slog.Warn("reload: provider reconnect failed; keeping previous", "provider", name, "err", err)
+			delete(toReplace, name)
+			continue
+		}
+		connected[name] = c
+		slog.Info("reload: provider replaced",
+			"provider", name,
+			"transport", prov.TransportType(),
+			"tools", len(c.Tools()))
+	}
+
+	// Swap state and collect old clients for deferred close.
+	var toClose []*mcpclient.Client
+	r.mu.Lock()
+	for name := range toRemove {
+		if c, ok := r.clients[name]; ok {
+			toClose = append(toClose, c)
+		}
+		delete(r.clients, name)
+		delete(r.info, name)
+		delete(r.entries, name)
+		slog.Info("reload: provider removed", "provider", name)
+	}
+	for name := range toReplace {
+		if c, ok := r.clients[name]; ok {
+			toClose = append(toClose, c)
+		}
+	}
+	for name, c := range connected {
+		prov := newCfg.MCPServers[name]
+		r.clients[name] = c
+		r.info[name] = Info{Name: name, Description: prov.Description}
+		r.entries[name] = prov
+	}
+	r.mu.Unlock()
+
+	for _, c := range toClose {
+		if err := c.Close(); err != nil {
+			slog.Warn("reload: close old client failed", "err", err)
+		}
+	}
+	return nil
+}
+
+// diffEntries returns (added, removed, replaced) maps. A name is
+// "replaced" when both maps contain it but the entries differ.
+func diffEntries(old, next map[string]config.ProviderConfig) (added, removed, replaced map[string]config.ProviderConfig) {
+	added = make(map[string]config.ProviderConfig)
+	removed = make(map[string]config.ProviderConfig)
+	replaced = make(map[string]config.ProviderConfig)
+	for name, prov := range next {
+		if cur, ok := old[name]; !ok {
+			added[name] = prov
+		} else if !sameEntry(cur, prov) {
+			replaced[name] = prov
+		}
+	}
+	for name, prov := range old {
+		if _, ok := next[name]; !ok {
+			removed[name] = prov
+		}
+	}
+	return
+}
+
+func sameEntry(a, b config.ProviderConfig) bool {
+	if a.Command != b.Command || a.URL != b.URL || a.Type != b.Type || a.Description != b.Description {
+		return false
+	}
+	if !equalStringSlice(a.Args, b.Args) || !equalStringSlice(a.Scopes, b.Scopes) {
+		return false
+	}
+	return equalStringMap(a.Env, b.Env) && equalStringMap(a.Headers, b.Headers)
+}
+
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalStringMap(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // connect builds the mcpclient.ProviderSpec for a configured server,
