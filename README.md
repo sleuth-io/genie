@@ -82,7 +82,15 @@ Genie makes two distinct LLM calls per cache-miss node:
 - **NORMALIZE** — small structured-JSON output (canonical schema + rename maps). Sonnet/Haiku is plenty.
 - **GENERATE** — writes a Python script that invokes upstream MCP tools. Benefits from Opus's reasoning.
 
-Override per-call-type with `GENIE_NORMALIZE_MODEL` and `GENIE_GENERATE_MODEL` (full model IDs like `claude-sonnet-4-5-20250929`, or short aliases the claude CLI accepts like `sonnet`). Empty ⇒ backend default (Opus 4.7 for the SDK; Claude Code's session default for the CLI).
+Override per-call-type with `GENIE_NORMALIZE_MODEL` and `GENIE_GENERATE_MODEL`. Canonical IDs (verified against the Anthropic SDK; see `internal/llm/models.go` for the single source of truth):
+
+| Model | ID |
+|---|---|
+| Opus 4.7 | `claude-opus-4-7` |
+| Sonnet 4.6 | `claude-sonnet-4-6` |
+| Haiku 4.5 | `claude-haiku-4-5` |
+
+The claude CLI also accepts shorthand aliases (`opus`, `sonnet`, `haiku`). Empty env var ⇒ backend default (`claude-opus-4-7` for the SDK; Claude Code's session default for the CLI).
 
 ## Authentication
 

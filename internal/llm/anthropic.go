@@ -35,7 +35,7 @@ func (a *anthropicClient) Generate(ctx context.Context, system []SystemBlock, us
 
 	model := anthropic.Model(ModelFromContext(ctx))
 	if model == "" {
-		model = anthropic.ModelClaudeOpus4_7
+		model = anthropic.Model(DefaultModel)
 	}
 
 	params := anthropic.MessageNewParams{

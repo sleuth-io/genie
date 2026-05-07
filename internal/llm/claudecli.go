@@ -31,11 +31,22 @@ func (c *claudeCLI) Generate(ctx context.Context, system []SystemBlock, userText
 	prompt.WriteString("---\n\n")
 	prompt.WriteString(userText)
 
+	// Genie's plan-generation prompts don't need any of Claude
+	// Code's interactive scaffolding — no MCP servers (we ARE the
+	// MCP server here), no skills, no per-machine context
+	// injection, no session persistence. Each spawn pays setup
+	// cost for everything we don't disable, easily 5–10s/call. The
+	// flags below are individually safe under OAuth auth (unlike
+	// --bare, which requires ANTHROPIC_API_KEY).
 	args := []string{
 		"-p", prompt.String(),
 		"--output-format", "stream-json",
 		"--verbose",
 		"--allowedTools", "",
+		"--strict-mcp-config",                      // skip all MCP servers (none passed via --mcp-config)
+		"--disable-slash-commands",                 // skip skill discovery
+		"--exclude-dynamic-system-prompt-sections", // skip cwd/git/env injection
+		"--no-session-persistence",                 // skip writing transcript to ~/.claude
 	}
 	model := ModelFromContext(ctx)
 	if model == "" {
