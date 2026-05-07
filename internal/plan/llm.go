@@ -203,9 +203,34 @@ func (g *Generator) callLLM(ctx context.Context, callType, field string, system 
 //     having args: arg values may steer a different shape.
 //
 // Earlier this function also bailed when any child rename was
-// non-identity. That check is dropped: the parent already wrote
-// canonical keys, so we read canonical keys; the rename is the
-// engine's job, not ours.
+// non-identity. That check is dropped — but we DO have to handle
+// vocabulary divergence between the parent's GENERATE and the
+// child's NORMALIZE, which can pick different canonical names for
+// the same logical field.
+//
+// Concrete divergence we hit in production:
+//   - Parent script (GENERATE) projects `{"updater": {"displayName": ...}}`
+//     using the user's literal names, since the LLM at GENERATE
+//     time doesn't run NORMALIZE on grandchildren.
+//   - Child NORMALIZE for `last_updater` independently picks
+//     canonical name `display_name`.
+//   - Synthesize with only one key would read `parent["display_name"]`,
+//     find nothing, return null silently.
+//
+// Fix: emit a multi-key fallback in the synthesized script. Try
+// both the user's literal name (what the parent script likely
+// projected) and the child's own canonical (the rename map's
+// target). They're often the same; when they differ, the fallback
+// catches whichever the parent actually wrote.
+//
+// The OUTPUT key is canonical so the engine's rename projection
+// (which translates canonical→literal at compose time) still
+// produces the user-facing literal name.
+type synthKey struct {
+	out     string   // canonical name the script writes (engine renames this back to literal)
+	tryRead []string // ordered list of keys to try reading from parent
+}
+
 func (g *Generator) synthesizeProjection(n *engine.Node, parent any, rename *engine.NodeRename) (string, any, bool) {
 	if parent == nil {
 		return "", nil, false
@@ -216,42 +241,53 @@ func (g *Generator) synthesizeProjection(n *engine.Node, parent any, rename *eng
 	if len(n.Selection) == 0 {
 		return "", nil, false
 	}
-	keys := make([]string, 0, len(n.Selection))
+	keys := make([]synthKey, 0, len(n.Selection))
 	for _, child := range n.Selection {
 		if len(child.Selection) > 0 || len(child.Args) > 0 {
 			return "", nil, false
 		}
-		// Use the canonical name for the projection key. The parent
-		// script writes canonical names; we read canonical names.
-		// Falls back to the literal when no rename was recorded
-		// (which happens for identity cases).
 		canon := child.Name
 		if rename != nil {
 			if c, ok := rename.ChildrenLiteralToCanonical[child.Name]; ok {
 				canon = c
 			}
 		}
-		keys = append(keys, canon)
+		// Build read-attempt list: literal first (most common —
+		// LLM-generated parent scripts use literals), canonical
+		// second, deduped.
+		reads := []string{child.Name}
+		if canon != child.Name {
+			reads = append(reads, canon)
+		}
+		keys = append(keys, synthKey{out: canon, tryRead: reads})
 	}
 
-	// Inline the projection literal in both branches. Monty's
+	// Build the projection literal. Each entry is
+	//     "<canonical>": _d.get("<literal>") or _d.get("<canonical>")
+	// where _d is whichever dict variable is in scope. Monty's
 	// sandboxed Python doesn't expose module-level helpers to
-	// execute()'s scope, so a `_pick` helper would NameError at
-	// runtime — verified.
-	pick := func() string {
+	// execute()'s scope, so we inline rather than emitting a
+	// _pick helper.
+	pick := func(varName string) string {
 		var b strings.Builder
 		b.WriteString("{")
 		for i, k := range keys {
 			if i > 0 {
 				b.WriteString(", ")
 			}
-			fmt.Fprintf(&b, "%q: %s.get(%q)", k, "_d", k)
+			fmt.Fprintf(&b, "%q: ", k.out)
+			for j, r := range k.tryRead {
+				if j > 0 {
+					b.WriteString(" or ")
+				}
+				fmt.Fprintf(&b, "%s.get(%q)", varName, r)
+			}
 		}
 		b.WriteString("}")
 		return b.String()
 	}
-	itemPick := strings.ReplaceAll(pick(), "_d", "item")
-	parentPick := strings.ReplaceAll(pick(), "_d", "parent")
+	itemPick := pick("item")
+	parentPick := pick("parent")
 
 	var script strings.Builder
 	script.WriteString("def execute(args, parent):\n")
@@ -263,7 +299,7 @@ func (g *Generator) synthesizeProjection(n *engine.Node, parent any, rename *eng
 
 	properties := map[string]any{}
 	for _, k := range keys {
-		properties[k] = map[string]any{}
+		properties[k.out] = map[string]any{}
 	}
 	ioSchema := map[string]any{
 		"type":        "object",
@@ -677,6 +713,24 @@ clock API. They're regular host calls — no import needed.
   - now_epoch()           -> 1746541800                  unix seconds (int)
   - days_ago_iso(n=7)     -> "2026-04-29T14:30:00Z"      RFC 3339, UTC, n days ago
   - hours_ago_iso(n=24)   -> "2026-05-05T14:30:00Z"      RFC 3339, UTC, n hours ago
+
+When a query passes a numeric time arg like ` + "`days: 7`" + ` or ` + "`hours: 24`" + `,
+the value reaches your script as a Python int. Pass it directly:
+
+    n = args.get("days") or 7
+    since = days_ago_iso(n)            # works whether n is 7 (int) or 7.0 (float)
+
+Do NOT guard with ` + "`isinstance(x, str)`" + ` and skip the helper when the
+arg is numeric — the check fails for ints, the time clause silently
+drops, and the user's filter is ignored. Coerce explicitly if you
+need to:
+
+    n = args.get("days")
+    if isinstance(n, str):
+        n = int(n) if n.isdigit() else 7
+    elif not isinstance(n, (int, float)):
+        n = 7
+    since = days_ago_iso(int(n))
 
 ## Hallucinated field names
 
