@@ -63,6 +63,8 @@ func runMCPAdd(ctx context.Context, args []string) error {
 	description := fs.String("description", "", "human-readable description (shown in list_providers)")
 	noAuth := fs.Bool("no-auth", false, "skip the browser OAuth flow after adding (run `genie auth <name>` later)")
 	force := fs.Bool("force", false, "overwrite an existing provider with the same name")
+	clientID := fs.String("client-id", "", "OAuth client ID (use when the server doesn't support dynamic registration, e.g. Slack)")
+	clientSecret := fs.String("client-secret", "", "OAuth client secret for confidential clients")
 	var envFlags, headerFlags, scopeFlags stringList
 	fs.Var(&envFlags, "env", "child-process env var, KEY=VALUE (repeatable)")
 	fs.Var(&headerFlags, "header", "HTTP header, KEY=VALUE (repeatable)")
@@ -151,9 +153,11 @@ func runMCPAdd(ctx context.Context, args []string) error {
 			ProviderName: name,
 			ServerURL:    prov.URL,
 			Scopes:       prov.Scopes,
+			ClientID:     *clientID,
+			ClientSecret: *clientSecret,
 			Vault:        auth.Open(),
 		}); err != nil {
-			return fmt.Errorf("auth flow: %w (config not saved; rerun `genie mcp add` to retry)", err)
+			return fmt.Errorf("auth flow: %w\n(config not saved; rerun `genie mcp add` to retry)", err)
 		}
 	}
 

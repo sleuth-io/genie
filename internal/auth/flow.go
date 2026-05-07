@@ -27,6 +27,14 @@ type FlowConfig struct {
 	// Scopes is the list of OAuth scopes to request.
 	Scopes []string
 
+	// ClientID, when non-empty, is used directly instead of running
+	// dynamic client registration. Required for providers like
+	// Slack, Google, etc. that don't implement RFC 7591.
+	ClientID string
+
+	// ClientSecret accompanies ClientID for confidential clients.
+	ClientSecret string
+
 	// Vault persists state across runs. The flow saves the token
 	// (via the underlying mcp-go TokenStore) plus any client-
 	// registration metadata it obtains here.
@@ -76,6 +84,12 @@ func Run(ctx context.Context, cfg FlowConfig) error {
 	}
 	state.RedirectURI = redirectURI
 	state.Scopes = cfg.Scopes
+	// Caller-provided credentials win over whatever was persisted
+	// (e.g. user passed --client-id to override a stale one).
+	if cfg.ClientID != "" {
+		state.ClientID = cfg.ClientID
+		state.ClientSecret = cfg.ClientSecret
+	}
 	if err := cfg.Vault.Save(cfg.ProviderName, state); err != nil {
 		return fmt.Errorf("auth: save initial state: %w", err)
 	}
@@ -92,9 +106,16 @@ func Run(ctx context.Context, cfg FlowConfig) error {
 	handler.SetBaseURL(cfg.ServerURL)
 
 	// Dynamic client registration if we don't have credentials yet.
+	// If the server doesn't implement RFC 7591 (Slack, Google,
+	// GitHub OAuth apps, etc.) the user must register a client
+	// manually with the provider and pass the resulting credentials
+	// via --client-id / --client-secret.
 	if state.ClientID == "" {
 		if err := handler.RegisterClient(ctx, "Genie ("+cfg.ProviderName+")"); err != nil {
-			return fmt.Errorf("auth: dynamic client registration: %w", err)
+			return fmt.Errorf("auth: dynamic client registration not supported by this server (%s).\n"+
+				"Register a client manually at the provider's app settings and re-run with:\n"+
+				"  genie auth %s --client-id <id> [--client-secret <secret>]",
+				summariseDCRError(err), cfg.ProviderName)
 		}
 		state.ClientID = handler.GetClientID()
 		state.ClientSecret = handler.GetClientSecret()
@@ -182,6 +203,40 @@ func Run(ctx context.Context, cfg FlowConfig) error {
 
 	slog.Info("auth: token obtained", "provider", cfg.ProviderName)
 	return nil
+}
+
+// summariseDCRError reduces a long upstream error (often an HTML
+// 404 page from a non-MCP-aware host) to something readable. Pulls
+// the status code if present, drops everything after the first
+// 120 chars of the body.
+func summariseDCRError(err error) string {
+	msg := err.Error()
+	// Common shape from mcp-go: "registration request failed with
+	// status NNN: <body>". Truncate body.
+	for _, marker := range []string{"with status ", "status="} {
+		if i := indexOf(msg, marker); i >= 0 {
+			rest := msg[i+len(marker):]
+			head := truncate(rest, 80)
+			return marker + head
+		}
+	}
+	return truncate(msg, 120)
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // openURL opens the URL in the user's default browser.

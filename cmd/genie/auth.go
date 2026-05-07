@@ -18,6 +18,8 @@ import (
 func runAuth(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("auth", flag.ContinueOnError)
 	configPath := fs.String("config", "", "override config path")
+	clientID := fs.String("client-id", "", "OAuth client ID (use when the server doesn't support dynamic registration)")
+	clientSecret := fs.String("client-secret", "", "OAuth client secret for confidential clients")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -35,7 +37,7 @@ func runAuth(ctx context.Context, args []string) error {
 		}
 		return authLogout(rest[1])
 	default:
-		return authLogin(ctx, *configPath, rest[0])
+		return authLogin(ctx, *configPath, rest[0], *clientID, *clientSecret)
 	}
 }
 
@@ -58,7 +60,7 @@ func loadProviderConfig(configPath, name string) (config.ProviderConfig, error) 
 	return prov, nil
 }
 
-func authLogin(ctx context.Context, configPath, name string) error {
+func authLogin(ctx context.Context, configPath, name, clientID, clientSecret string) error {
 	prov, err := loadProviderConfig(configPath, name)
 	if err != nil {
 		return err
@@ -75,6 +77,8 @@ func authLogin(ctx context.Context, configPath, name string) error {
 		ProviderName: name,
 		ServerURL:    prov.URL,
 		Scopes:       prov.Scopes,
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
 		Vault:        vault,
 	}); err != nil {
 		return err
