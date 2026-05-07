@@ -80,27 +80,31 @@ scenarios:
       nonempty_paths_in_each:
         top_epics_by_completion_date: [key, summary]
 
-  - id: atlassian-my-issues-recent
+  - id: atlassian-latest-issues
     description: |
-      Issues touched recently. Tests two cold-call regressions:
-        1. Hallucinated nested object (`last_updater { displayName }`) —
-           parent's GENERATE projects literal `displayName`; child's
-           NORMALIZE picks canonical `display_name`. Synthesize must
-           read both keys to survive the divergence.
-        2. Numeric time arg (`days: 90`) — the int must reach
-           days_ago_iso(n) and produce a JQL `updated >=` clause.
-           If the script guards with isinstance(str) it silently
-           drops the filter and returns issues from any time period.
+      Most recently updated issues across the entire Jira instance.
 
-      90-day window is wide enough to virtually guarantee data on
-      any active developer's Jira. Tighten if your test account is
-      always-active and you want a sharper freshness check.
+      Replaces an earlier `my_issues_recent(days: N)` scenario that
+      depended on the test user's own activity. That made the
+      scenario flaky on low-activity accounts even when Genie was
+      working correctly. Switching to a limit-based, instance-wide
+      query removes the test-data dependency: any Jira with at
+      least 10 issues in its history will return enough rows to
+      exercise the assertions.
+
+      Tests the load-bearing displayName regression: a hallucinated
+      nested `last_updater { displayName }` selection where the
+      parent's GENERATE projects the literal name `displayName` and
+      the child's NORMALIZE independently picks canonical
+      `display_name`. The synthesize multi-key fallback (parent.get
+      ("displayName") or parent.get("display_name")) must catch the
+      divergence and produce a non-null value.
     provider: atlassian
-    query: '{ my_issues_recent(days: 90) { key summary status { name } updated last_updater { displayName } } }'
+    query: '{ latest_issues(limit: 10) { key summary status { name } updated last_updater { displayName } } }'
     assertions:
-      list_paths: [my_issues_recent]
+      list_paths: [latest_issues]
       nonempty_paths_in_each:
-        my_issues_recent: [key, summary, last_updater.displayName]
+        latest_issues: [key, summary, last_updater.displayName]
       expect_synthesize_for: [status, last_updater]
       forbid_in_scripts:
         - "except Exception"
