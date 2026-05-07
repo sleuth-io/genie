@@ -237,7 +237,7 @@ func (e *Executor) resolveNode(
 	// indexed for search" → fix again). The cache holds whatever
 	// the LLM last wrote; future calls hit it directly when the
 	// last attempt was good, or re-enter the retry loop otherwise.
-	for attempt := 0; err != nil && attempt < retryLimit(); attempt++ {
+	for attempt := 0; err != nil && attempt < RetryLimit(); attempt++ {
 		newSrc, newRename, newRaw, attemptErr := e.attemptRetry(ctx, n, parent, argMap, src, err.Error())
 		if newSrc == "" {
 			// Generator doesn't support retry, or the retry call
@@ -304,7 +304,7 @@ func (e *Executor) attemptRetry(
 	return newSrc, newRename, raw, nil
 }
 
-// retryLimit returns the maximum number of retry attempts per
+// RetryLimit returns the maximum number of retry attempts per
 // resolveNode call. Configurable via GENIE_RETRY_LIMIT for users
 // hitting providers with multi-step constraint discovery.
 //
@@ -313,7 +313,11 @@ func (e *Executor) attemptRetry(
 // occasional second retry (the fix introduced a new issue), and
 // 3+ rarely converges — better to surface the failure and let the
 // human adjust the query.
-func retryLimit() int {
+//
+// Exported so the plan package can apply the same budget to the
+// pre-persist GENERATE validation loop (callers shouldn't need a
+// second knob for "how many times to retry the LLM").
+func RetryLimit() int {
 	if v := os.Getenv("GENIE_RETRY_LIMIT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			return n

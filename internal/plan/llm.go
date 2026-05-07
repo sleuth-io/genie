@@ -556,6 +556,48 @@ func (g *Generator) fullGenerate(ctx context.Context, n *engine.Node, parent any
 	if err != nil {
 		return nil, fmt.Errorf("parse llm response: %w (raw=%q)", err, truncate(resp.Text, 500))
 	}
+
+	// Pre-persist validation loop. The executor also runs
+	// ValidateScript (executor.go:resolveNode) before executing —
+	// but by then the bad script is already in L2. If we let it
+	// land, every paraphrase that L2-hits this canonical schema
+	// will pay an avoidable retry round-trip. Catch it here and
+	// regenerate with the violation as feedback so only a
+	// compliant script reaches PutEntry.
+	for attempt := 0; attempt < engine.RetryLimit(); attempt++ {
+		violation := engine.ValidateScript(out.MontyScript)
+		if violation == "" {
+			break
+		}
+		slog.Warn("plan: generated script violates static invariant; regenerating",
+			"field", n.Name,
+			"violation", violation,
+			"attempt", attempt+1,
+		)
+		retryText, berr := buildRetryPrompt(n, parent, canon, out.MontyScript, violation)
+		if berr != nil {
+			return nil, fmt.Errorf("build validation-retry prompt: %w", berr)
+		}
+		resp, err := g.callLLM(ctx, "regenerate", n.Name, g.generateSystem, retryText)
+		if err != nil {
+			return nil, fmt.Errorf("validation-retry llm call: %w", err)
+		}
+		logUsage("regenerate", resp.Usage)
+		g.metrics.GenerateCalls++
+		g.metrics.GenerateInputTokens += resp.Usage.InputTokens
+		g.metrics.GenerateOutputTokens += resp.Usage.OutputTokens
+		g.metrics.CacheReadInputTokens += resp.Usage.CacheReadTokens
+		g.metrics.CacheCreationInputTokens += resp.Usage.CacheCreationTokens
+		next, perr := parseLLMResponse(resp.Text)
+		if perr != nil {
+			return nil, fmt.Errorf("parse validation-retry response: %w", perr)
+		}
+		out = next
+	}
+	if violation := engine.ValidateScript(out.MontyScript); violation != "" {
+		return nil, fmt.Errorf("script validation failed after %d attempts: %s", engine.RetryLimit(), violation)
+	}
+
 	return out, nil
 }
 
@@ -736,6 +778,26 @@ need to:
 
 Hallucinated GraphQL field names are intentional: the user may request fields that do not exist on any real schema. Treat the field name as an intent signal — pick the closest sensible interpretation given the available tools and the arg list. If a requested field has no plausible mapping, return null for it; do not raise.
 
+## Resolve opaque identifiers when a human-readable field is requested
+
+The user's selection often asks for human-readable fields (` + "`name`" + `, ` + "`displayName`" + `, ` + "`title`" + `, ` + "`label`" + `) at a position where the upstream tool's response only carries an opaque identifier (e.g. ` + "`authorId`" + `, ` + "`ownerId`" + `, ` + "`userId`" + `, ` + "`assigneeAccountId`" + `, ` + "`createdById`" + `). Returning the raw ID where a name was requested is a silent data bug — the caller can't tell, and the answer is unusable.
+
+When this happens, scan the catalog for a tool that resolves the ID kind to a record, and call it. Common naming patterns: ` + "`lookup_<kind>_id`" + `, ` + "`get_<kind>_by_id`" + `, ` + "`get_<kind>`" + `. Pick the one whose input schema accepts the opaque ID you have and whose output schema contains the human-readable field you need.
+
+Pseudocode:
+
+    raw_value = item.get("displayName") or item.get("name")
+    if raw_value and is_opaque_id(raw_value):
+        # The upstream returned just an ID; look up the record to get
+        # the actual name. The catalog has a tool for this — use it.
+        resolved = lookup_kind_by_id(id=raw_value)
+        if isinstance(resolved, dict):
+            raw_value = resolved.get("displayName") or resolved.get("name") or raw_value
+
+` + "`is_opaque_id(s)`" + ` is up to your judgement: typically a hex/uuid-shaped string, an all-digit string, or any value that obviously isn't a human name. When in doubt, attempt the lookup — if the catalog has no resolver tool, return the raw value as-is rather than raising.
+
+Cache the resolution within the script (one dict on the local function frame) so iterating a 50-item list doesn't make 50 round-trips for the same ID.
+
 ## Defensive shape handling on SUCCESSFUL responses
 
 A cached script may be reused for a paraphrase where the response shape differs subtly. On a successful response (the call did not raise), defensively handle every plausible shape rather than assuming one.
@@ -857,6 +919,21 @@ Two args that pick different facets of the same entity are NOT the same. Keep th
   - orthogonal filters that combine
 
 The script-side handles arg VALUES at runtime, but arg NAMES with different semantics drive different code paths and therefore different cached scripts. Preserve them.
+
+## Never silently drop a user-supplied arg
+
+Every arg the user wrote at this node MUST appear in ` + "`canonical_schema.args`" + ` (under its canonical name) AND in ` + "`arg_rename`" + ` (mapping the literal to the canonical). Dropping an arg from canonical_schema means GENERATE never sees it — the user's filter, limit, or sort silently disappears and the result set is wrong without any error surface.
+
+If you believe the arg has no plausible counterpart in any catalog tool's input schema, still keep it in canonical_schema.args under its closest sensible canonical name (e.g. ` + "`limit`" + `, ` + "`max_results`" + `, ` + "`page_size`" + ` for size-bounding args; ` + "`since`" + `, ` + "`updated_after`" + ` for time-window args). The script side decides what to do with it; NORMALIZE's job is to preserve user intent.
+
+Bad:
+  Input:  { thingies(text: "foo", limit: 5) { ... } }
+  Output: canonical_schema.args = ["query"]            ← lost limit
+          arg_rename = {"text": "query", "limit": "limit"}   ← rename present but excluded from args
+
+Good:
+  Output: canonical_schema.args = ["limit", "query"]   ← both preserved, alphabetical
+          arg_rename = {"text": "query", "limit": "limit"}
 
 ## Implied-arg rule (paraphrases that elide a default)
 
