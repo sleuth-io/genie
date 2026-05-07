@@ -1,9 +1,12 @@
-// Package envfile auto-loads a .env file into the process environment at
-// startup. Tiny, deliberate replacement for github.com/joho/godotenv — we
+// Package envfile loads a .env file into the process environment.
+// Used only by the dev/CI eval entry point — the user-facing binary
+// reads normal process env and never touches .env on its own.
+//
+// Tiny, deliberate replacement for github.com/joho/godotenv — we
 // don't need quoting rules, multi-line values, or variable expansion.
 //
-// Existing process env always wins. Lines starting with '#' or blank are
-// ignored. KEY=VALUE only.
+// Existing process env always wins. Lines starting with '#' or blank
+// are ignored. KEY=VALUE only.
 package envfile
 
 import (
@@ -13,35 +16,16 @@ import (
 	"strings"
 )
 
-// PathEnvVar lets callers point the loader at an alternate file (e.g.
-// during local testing, when secrets live in another project's .env).
-// When set, the named file MUST exist; missing-file is treated as an
-// error so that a typo in the path doesn't silently fall back to a
-// wrong-but-present default.
-const PathEnvVar = "GENIE_ENV_FILE"
-
-// Load resolves which file to read and applies it. Behaviour:
-//
-//   - If GENIE_ENV_FILE is set: read that path. Missing file is an error.
-//   - Otherwise: read ./.env if present. Missing file is fine.
-//
-// In either mode, existing env vars take precedence over file contents.
+// Load reads ./.env if present and applies it to the process
+// environment. A missing file is fine (returns nil). Existing env
+// vars take precedence over file contents.
 func Load() error {
-	if path := os.Getenv(PathEnvVar); path != "" {
-		return loadFile(path, false)
-	}
-	return loadFile(".env", true)
-}
-
-// loadFile reads `path` line-by-line. If `optional` is true, a missing
-// file is silently skipped; otherwise it is reported as an error.
-func loadFile(path string, optional bool) error {
-	f, err := os.Open(path)
+	f, err := os.Open(".env")
 	if err != nil {
-		if optional && os.IsNotExist(err) {
+		if os.IsNotExist(err) {
 			return nil
 		}
-		return fmt.Errorf("open env file %q: %w", path, err)
+		return fmt.Errorf("open .env: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 
@@ -56,7 +40,7 @@ func loadFile(path string, optional bool) error {
 		line = strings.TrimPrefix(line, "export ")
 		eq := strings.IndexByte(line, '=')
 		if eq <= 0 {
-			return fmt.Errorf("%s:%d: malformed line (expected KEY=VALUE)", path, lineNo)
+			return fmt.Errorf(".env:%d: malformed line (expected KEY=VALUE)", lineNo)
 		}
 		key := strings.TrimSpace(line[:eq])
 		val := strings.TrimSpace(line[eq+1:])
@@ -65,11 +49,11 @@ func loadFile(path string, optional bool) error {
 			continue
 		}
 		if err := os.Setenv(key, val); err != nil {
-			return fmt.Errorf("%s:%d: setenv %s: %w", path, lineNo, key, err)
+			return fmt.Errorf(".env:%d: setenv %s: %w", lineNo, key, err)
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("read %q: %w", path, err)
+		return fmt.Errorf("read .env: %w", err)
 	}
 	return nil
 }

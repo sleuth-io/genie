@@ -4,8 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 
+	"github.com/sleuth-io/genie/internal/envfile"
 	"github.com/sleuth-io/genie/internal/eval"
 	"github.com/sleuth-io/genie/pkg/genie"
 )
@@ -17,10 +19,15 @@ import (
 //	Phase 2 (--replay): run all cases AGAIN against the now-warm cache.
 //	                    This is the replay measurement (hypothesis 2).
 //
-// The eval harness builds a single GitHub provider programmatically
-// from the env, so it doesn't depend on the user having a config file
-// in place.
+// eval is the dev/CI entry point — not part of the user-facing CLI.
+// It builds a single GitHub provider programmatically from the env,
+// so it doesn't depend on a config file. It auto-loads ./.env if
+// present so reproduction commands work without exporting tokens by
+// hand; the rest of the binary uses normal process env only.
 func runEval(ctx context.Context, args []string) error {
+	if err := envfile.Load(); err != nil {
+		slog.Warn("eval: failed loading .env (continuing with process env)", "err", err)
+	}
 	fs := flag.NewFlagSet("eval", flag.ContinueOnError)
 	intentsPath := fs.String("intents", "eval/intents.yaml", "path to intents YAML")
 	advPath := fs.String("adversarial", "eval/adversarial.yaml", "path to adversarial YAML")
