@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
@@ -27,6 +28,7 @@ import (
 	"github.com/sleuth-io/genie/internal/engine"
 	"github.com/sleuth-io/genie/internal/llm"
 	"github.com/sleuth-io/genie/internal/mcpclient"
+	"github.com/sleuth-io/genie/internal/session"
 )
 
 // Generator wires an Anthropic client + tool catalog + crystallize store
@@ -49,6 +51,8 @@ type Generator struct {
 	normalizeSystem []llm.SystemBlock
 	toolNames       []string // monty-side names like github_list_pull_requests
 	tools           []mcp.Tool
+	provider        string // routing key — recorded in session entries
+	session         *session.Session
 
 	// metrics for hypothesis-2 measurement
 	metrics Metrics
@@ -91,7 +95,8 @@ func (g *Generator) NormalizeOnly(ctx context.Context, n *engine.Node) (string, 
 // NewGenerator initialises the generator. Call once per (provider, store)
 // scope. The LLM client is injected so callers can pick a backend
 // (Anthropic SDK, Claude Code CLI, …) per the rules in package llm.
-func NewGenerator(c *mcpclient.Client, store *crystallize.Store, llmClient llm.Client) *Generator {
+// sess is the JSONL session log; pass nil to skip recording.
+func NewGenerator(c *mcpclient.Client, store *crystallize.Store, llmClient llm.Client, provider string, sess *session.Session) *Generator {
 	tools := c.Tools()
 	catalog := renderToolCatalog(tools)
 
@@ -102,7 +107,50 @@ func NewGenerator(c *mcpclient.Client, store *crystallize.Store, llmClient llm.C
 		normalizeSystem: buildNormalizeSystem(catalog),
 		toolNames:       c.MontyToolNames(),
 		tools:           tools,
+		provider:        provider,
+		session:         sess,
 	}
+}
+
+// callLLM is a thin wrapper around g.client.Generate that records
+// the request/response pair to the JSONL session log. callType is
+// "normalize" or "generate"; field is the GraphQL field name being
+// resolved (for context when reading the log).
+func (g *Generator) callLLM(ctx context.Context, callType, field string, system []llm.SystemBlock, userText string) (llm.Response, error) {
+	start := time.Now()
+	resp, err := g.client.Generate(ctx, system, userText)
+	rec := session.Record{
+		Call:       callType,
+		Provider:   g.provider,
+		Field:      field,
+		SystemText: joinBlocks(system),
+		UserText:   userText,
+		DurationMS: time.Since(start).Milliseconds(),
+	}
+	if err != nil {
+		rec.Err = err.Error()
+	} else {
+		rec.Response = resp.Text
+		rec.Usage = &session.Usage{
+			InputTokens:         resp.Usage.InputTokens,
+			OutputTokens:        resp.Usage.OutputTokens,
+			CacheCreationTokens: resp.Usage.CacheCreationTokens,
+			CacheReadTokens:     resp.Usage.CacheReadTokens,
+		}
+	}
+	g.session.Append(rec)
+	return resp, err
+}
+
+func joinBlocks(blocks []llm.SystemBlock) string {
+	var b strings.Builder
+	for i, blk := range blocks {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(blk.Text)
+	}
+	return b.String()
 }
 
 // Generate is engine.ScriptGenerator. On each call:
@@ -191,7 +239,7 @@ func (g *Generator) fullGenerate(ctx context.Context, n *engine.Node, parent any
 		"shape_hash", n.Shape().L1Hash()[:12],
 	)
 
-	resp, err := g.client.Generate(ctx, g.generateSystem, userText)
+	resp, err := g.callLLM(ctx, "generate", n.Name, g.generateSystem, userText)
 	if err != nil {
 		return nil, fmt.Errorf("llm call: %w", err)
 	}

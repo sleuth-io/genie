@@ -42,7 +42,7 @@ install: build ## Install binary to ~/.local/bin
 		   echo "  export PATH=\"\$$PATH:\$$HOME/.local/bin\"" ;; \
 	esac
 
-TEST_PKGS=./internal/config/... ./internal/engine/... ./internal/llm/... ./internal/providers/... ./pkg/...
+TEST_PKGS=./internal/config/... ./internal/engine/... ./internal/llm/... ./internal/providers/... ./internal/session/... ./pkg/...
 
 test: ## Run unit tests (no external API calls)
 	@echo "Running tests..."

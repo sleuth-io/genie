@@ -48,7 +48,7 @@ func (g *Generator) normalizeNode(
 		"shape_hash", n.Shape().L1Hash()[:12],
 	)
 
-	resp, err := g.client.Generate(ctx, g.normalizeSystem, user)
+	resp, err := g.callLLM(ctx, "normalize", n.Name, g.normalizeSystem, user)
 	if err != nil {
 		return nil, "", nil, nil, err
 	}

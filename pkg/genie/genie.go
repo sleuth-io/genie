@@ -33,6 +33,7 @@ import (
 	"github.com/sleuth-io/genie/internal/providers"
 	"github.com/sleuth-io/genie/internal/runtime"
 	"github.com/sleuth-io/genie/internal/sandbox"
+	"github.com/sleuth-io/genie/internal/session"
 )
 
 // Config configures a Genie instance. Either Providers or ConfigPath
@@ -122,6 +123,7 @@ type Genie struct {
 	llm        llm.Client
 	cacheRoot  string
 	configPath string // empty when Providers were passed programmatically (no reload source)
+	session    *session.Session
 
 	mu      sync.RWMutex
 	bundles map[string]*providerBundle
@@ -170,10 +172,15 @@ func New(ctx context.Context, cfg Config) (*Genie, error) {
 	}
 	slog.Info("genie: llm backend selected", "backend", backend)
 
+	sess := session.New()
+	if path := sess.Path(); path != "" {
+		slog.Info("genie: session log", "id", sess.ID(), "path", path)
+	}
+
 	bundles := make(map[string]*providerBundle, len(registry.Names()))
 	for _, name := range registry.Names() {
 		client, _ := registry.Get(name)
-		bundles[name] = buildProviderBundle(name, client, monty, llmClient, cacheRoot)
+		bundles[name] = buildProviderBundle(name, client, monty, llmClient, cacheRoot, sess)
 	}
 
 	return &Genie{
@@ -182,8 +189,18 @@ func New(ctx context.Context, cfg Config) (*Genie, error) {
 		llm:        llmClient,
 		cacheRoot:  cacheRoot,
 		configPath: configPath,
+		session:    sess,
 		bundles:    bundles,
 	}, nil
+}
+
+// SessionPath returns the path of the JSONL session log for this
+// Genie instance, or "" if logging fell back to no-op.
+func (g *Genie) SessionPath() string {
+	if g == nil {
+		return ""
+	}
+	return g.session.Path()
 }
 
 // Reload re-reads the config from the path used at construction,
@@ -216,7 +233,7 @@ func (g *Genie) Reload(ctx context.Context) error {
 			newBundles[name] = existing // unchanged — reuse so plan-Generator metrics survive
 			continue
 		}
-		newBundles[name] = buildProviderBundle(name, client, g.monty, g.llm, g.cacheRoot)
+		newBundles[name] = buildProviderBundle(name, client, g.monty, g.llm, g.cacheRoot, g.session)
 	}
 	g.bundles = newBundles
 	return nil
@@ -326,13 +343,16 @@ func (g *Genie) Close() error {
 	if g.registry != nil {
 		_ = g.registry.Close()
 	}
+	if g.session != nil {
+		_ = g.session.Close()
+	}
 	if g.monty != nil {
 		return g.monty.Close()
 	}
 	return nil
 }
 
-func buildProviderBundle(name string, client *mcpclient.Client, monty *runtime.MontyEngine, llmClient llm.Client, cacheRoot string) *providerBundle {
+func buildProviderBundle(name string, client *mcpclient.Client, monty *runtime.MontyEngine, llmClient llm.Client, cacheRoot string, sess *session.Session) *providerBundle {
 	mcpFuncs, mcpParams := mcpclient.BuildHostFunctions(client)
 	clockFuncs, clockParams := sandbox.BuildClockBuiltins()
 	builtIns, params := sandbox.MergeBuiltins(
@@ -352,7 +372,7 @@ func buildProviderBundle(name string, client *mcpclient.Client, monty *runtime.M
 	}
 
 	store := crystallize.NewStore(filepath.Join(cacheRoot, name))
-	gen := plan.NewGenerator(client, store, llmClient)
+	gen := plan.NewGenerator(client, store, llmClient, name, sess)
 	ex := engine.NewExecutor(monty, caps, store).WithGenerator(gen)
 
 	return &providerBundle{
