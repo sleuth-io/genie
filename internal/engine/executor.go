@@ -202,7 +202,14 @@ func (e *Executor) resolveNode(
 		argMap[rename.canonicalArgName(a.Name)] = a.Value
 	}
 
-	memoKey := hash + "|" + canonicalArgsHash(argMap)
+	// Memoize by (shape, args, parent identity). For top-level
+	// nodes parent is nil and the memo collapses arg-equivalent
+	// invocations. For child nodes, parent varies per row — memoing
+	// on (shape, args) alone would return the first row's result for
+	// every subsequent row, which is the cross-row leakage that
+	// makes a list's author/owner/etc. fields all collapse to the
+	// first row's value.
+	memoKey := hash + "|" + canonicalArgsHash(argMap) + "|" + parentMemoKey(parent)
 	if v, hit := memo[memoKey]; hit {
 		return v, nil
 	}
@@ -390,6 +397,24 @@ func canonicalArgsHash(args map[string]any) string {
 	// sorts map keys lexicographically for map[string]any, but only at the
 	// top level — nested maps would also be sorted, so we're fine.
 	b, err := json.Marshal(args)
+	if err != nil {
+		return "_marshal_err_"
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// parentMemoKey produces a stable hex hash distinguishing parent
+// values for the per-query memo. Top-level nodes have parent==nil
+// and collapse to the same key (the desired behaviour — same args
+// = same result). Child nodes get a parent-specific key so a list
+// of N rows produces N separate memo entries instead of N copies
+// of the first row's result.
+func parentMemoKey(parent any) string {
+	if parent == nil {
+		return "_"
+	}
+	b, err := json.Marshal(parent)
 	if err != nil {
 		return "_marshal_err_"
 	}
