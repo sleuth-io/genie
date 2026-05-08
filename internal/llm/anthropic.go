@@ -190,6 +190,110 @@ func (a *anthropicClient) Chat(ctx context.Context, req ChatRequest) (ChatRespon
 	return resp, nil
 }
 
+// Drive runs the explore-then-submit loop end-to-end against the
+// Anthropic SDK. Each turn the model can either call upstream tools
+// (Drive routes the call through req.Executor and feeds the result
+// back as the next turn's tool_result) or call req.SubmitToolName
+// (Drive captures the input as LoopResult.Submit and ends).
+//
+// Per-tool observations are captured for verification replay. The
+// model-facing tool name is preserved as Observation.ToolName — the
+// caller (plan.Generator) handles any further translation.
+//
+// Bounded by 12 turns; matches plan/llm.go's previous handcrafted
+// loop budget.
+func (a *anthropicClient) Drive(ctx context.Context, req DriveRequest) (LoopResult, error) {
+	const maxTurns = 12
+
+	messages := append([]Message(nil), req.Messages...)
+	res := LoopResult{}
+
+	for turn := 0; turn < maxTurns; turn++ {
+		chatResp, err := a.Chat(ctx, ChatRequest{
+			System:   req.System,
+			Messages: messages,
+			Tools:    req.Tools,
+		})
+		if err != nil {
+			return res, fmt.Errorf("chat turn %d: %w", turn, err)
+		}
+		res.Usage.InputTokens += chatResp.Usage.InputTokens
+		res.Usage.OutputTokens += chatResp.Usage.OutputTokens
+		res.Usage.CacheCreationTokens += chatResp.Usage.CacheCreationTokens
+		res.Usage.CacheReadTokens += chatResp.Usage.CacheReadTokens
+		res.StopReason = chatResp.StopReason
+
+		if len(chatResp.ToolUses) == 0 {
+			res.FinalText = chatResp.Text
+			return res, nil
+		}
+
+		// Append the assistant turn so the next chat round has the
+		// full conversation history.
+		messages = append(messages, Message{
+			Role:     "assistant",
+			Text:     chatResp.Text,
+			ToolUses: chatResp.ToolUses,
+		})
+
+		results := make([]ToolResult, 0, len(chatResp.ToolUses))
+		var submittedThisTurn bool
+		for _, tu := range chatResp.ToolUses {
+			if tu.Name == req.SubmitToolName && req.SubmitToolName != "" {
+				res.Submit = tu.Input
+				submittedThisTurn = true
+				results = append(results, ToolResult{
+					ToolUseID: tu.ID,
+					Content:   "received",
+				})
+				continue
+			}
+			if req.Executor == nil {
+				results = append(results, ToolResult{
+					ToolUseID: tu.ID,
+					Content:   "no executor wired for tool " + tu.Name,
+					IsError:   true,
+				})
+				continue
+			}
+			result, callErr := req.Executor.Call(ctx, tu.Name, tu.Input)
+			if callErr != nil {
+				results = append(results, ToolResult{
+					ToolUseID: tu.ID,
+					Content:   callErr.Error(),
+					IsError:   true,
+				})
+				continue
+			}
+			res.Observations = append(res.Observations, Observation{
+				ToolName: tu.Name,
+				Args:     tu.Input,
+				Result:   result,
+			})
+			payload, _ := json.Marshal(result)
+			content := string(payload)
+			if len(content) > 50000 {
+				content = content[:50000] + "\n... [truncated]"
+			}
+			results = append(results, ToolResult{
+				ToolUseID: tu.ID,
+				Content:   content,
+			})
+		}
+
+		if submittedThisTurn {
+			return res, nil
+		}
+
+		messages = append(messages, Message{
+			Role:        "user",
+			ToolResults: results,
+		})
+	}
+
+	return res, fmt.Errorf("tool-use loop hit %d turn limit without submit", maxTurns)
+}
+
 // convertMessage flips llm.Message → anthropic.MessageParam. Handles
 // the three valid combinations: user text, user tool-results,
 // assistant text-and/or-tool-uses.

@@ -64,6 +64,89 @@ type ChatClient interface {
 	Chat(ctx context.Context, req ChatRequest) (ChatResponse, error)
 }
 
+// ToolUseDriver runs an end-to-end tool-use loop in the backend's
+// native style. Genie hands over an initial prompt + tool catalog +
+// an executor for tool calls; the driver returns a single
+// LoopResult containing the final assistant content (text or a
+// Submit), every (toolName, args, response) tuple captured during
+// the loop, and aggregate usage.
+//
+// Why this is separate from ChatClient: the SDK and the claude CLI
+// expose tool-use through fundamentally different APIs. The SDK is
+// turn-by-turn — Genie sees each model tool_use, executes it,
+// passes the result back. The CLI in stream-json + --mcp-config
+// mode runs the model's tool-use loop INTERNALLY; Genie observes
+// the resulting events. ToolUseDriver hides the difference: each
+// backend drives its own loop, plan.Generator just calls Drive
+// once per cold-cache GENERATE.
+//
+// Backends without tool-use support don't implement this interface;
+// plan.Generator falls back to single-turn Generate.
+type ToolUseDriver interface {
+	Client
+	Drive(ctx context.Context, req DriveRequest) (LoopResult, error)
+}
+
+// DriveRequest is the input to one tool-use loop. Messages carries
+// any prior conversation (e.g. an initial user prompt plus, on a
+// revision turn, the original conversation + a "verification
+// failed" follow-up). Tools is the list of tool definitions the
+// model may call. Executor handles the actual call for each tool —
+// SDK backends call it explicitly per model tool_use, CLI backends
+// may ignore it (claude code's MCP layer dispatches calls itself).
+//
+// Provider is the upstream provider name; CLI backends use it to
+// scope --allowedTools. SubmitToolName is the synthetic tool whose
+// invocation terminates the loop (typically "submit_script").
+type DriveRequest struct {
+	System         []SystemBlock
+	Messages       []Message
+	Tools          []ToolDef
+	Executor       ToolExecutor
+	Provider       string
+	SubmitToolName string
+}
+
+// LoopResult is the outcome of one Drive call.
+//
+//   - Submit holds the parsed input of the SubmitToolName call when the
+//     model terminated by calling it. nil when the loop ended any
+//     other way (turn limit, model emitted final text without
+//     submitting, etc.).
+//   - FinalText is non-empty only when the model ended without calling
+//     the submit tool (used as fallback content for error reporting).
+//   - Observations captures every tool call made during the loop —
+//     each entry is one (toolName, args, result) tuple. The caller
+//     persists these as fixtures and uses them for verification
+//     replay.
+//   - Usage aggregates token counts across every turn the driver ran
+//     internally.
+type LoopResult struct {
+	Submit       map[string]any
+	FinalText    string
+	Observations []Observation
+	Usage        Usage
+	StopReason   string
+}
+
+// Observation is one tool call the loop captured: the script-side
+// canonical name (e.g. "github_lookupJiraAccountId" — the name the
+// generated monty script will use), the arguments, and the result.
+type Observation struct {
+	ToolName string
+	Args     map[string]any
+	Result   any
+}
+
+// ToolExecutor abstracts upstream tool execution for SDK-style loop
+// drivers that need to run the model's tool calls themselves. The
+// name passed in is the model-facing tool name (e.g. "github_X");
+// the implementation is responsible for any prefix translation
+// before reaching the upstream MCP server.
+type ToolExecutor interface {
+	Call(ctx context.Context, toolName string, args map[string]any) (any, error)
+}
+
 // ToolDef declares a tool the model may call during a Chat turn.
 // The InputSchema is the JSON-Schema description of expected args.
 type ToolDef struct {

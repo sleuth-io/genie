@@ -533,7 +533,7 @@ func (g *Generator) Generate(ctx context.Context, n *engine.Node, parent any) (s
 		fixtureSet     fixtures.Set
 		expectedOutput any
 	)
-	if _, isChat := g.client.(llm.ChatClient); isChat && g.monty != nil && g.caps != nil {
+	if _, isDriver := g.client.(llm.ToolUseDriver); isDriver && g.monty != nil && g.caps != nil {
 		out, fixtureSet, expectedOutput, err = g.fullGenerateToolUse(ctx, n, parent, canonSchema, rename)
 		if err != nil {
 			return "", nil, err
@@ -651,12 +651,6 @@ func (g *Generator) fullGenerate(ctx context.Context, n *engine.Node, parent any
 // upstream MCP tool name so collisions are impossible.
 const submitScriptToolName = "submit_script"
 
-// maxToolUseTurns caps the explore-then-submit loop. Enough for
-// real-world resolution chains (catalog inspection → list → resolve
-// → submit) without letting a confused model burn LLM cost
-// unbounded.
-const maxToolUseTurns = 12
-
 // fullGenerateToolUse drives the explore-then-submit GENERATE loop
 // with in-loop verification. The model is given the upstream tool
 // catalog as REAL Anthropic tools, calls them to learn response
@@ -673,7 +667,7 @@ const maxToolUseTurns = 12
 //   - the fixture set captured during exploration (for L2 persist)
 //   - the LLM-stated expected_output (for L2 persist)
 func (g *Generator) fullGenerateToolUse(ctx context.Context, n *engine.Node, parent any, canon *canonicalSchema, rename *engine.NodeRename) (*llmOutput, fixtures.Set, any, error) {
-	chatClient, ok := g.client.(llm.ChatClient)
+	driver, ok := g.client.(llm.ToolUseDriver)
 	if !ok {
 		return nil, nil, nil, errors.New("llm client does not support tool-use")
 	}
@@ -688,12 +682,8 @@ func (g *Generator) fullGenerateToolUse(ctx context.Context, n *engine.Node, par
 
 	tools := g.buildToolDefs()
 	messages := []llm.Message{{Role: "user", Text: userText}}
-	fixtureSet := fixtures.Set{}
-	revisions := 0
 	const maxRevisions = 1
 
-	// Build the canonical-keyed args the script will see during
-	// verification: the user's literal args mapped through rename.
 	verifyArgs := map[string]any{}
 	for _, a := range n.Args {
 		key := a.Name
@@ -708,164 +698,142 @@ func (g *Generator) fullGenerateToolUse(ctx context.Context, n *engine.Node, par
 	progress.Report(ctx, "Generating script for %q (tool-use)…", n.Name)
 	ctx = llm.WithModel(ctx, g.generateModel)
 
-	for turn := 0; turn < maxToolUseTurns; turn++ {
-		req := llm.ChatRequest{
-			System:   g.generateSystemToolUse,
-			Messages: messages,
-			Tools:    tools,
-		}
+	executor := &mcpToolExecutor{client: g.mcp, prefix: mcpclient.HostNamePrefix, providerPrefix: "mcp__" + g.provider + "__"}
 
+	var fixtureSet fixtures.Set
+
+	for revision := 0; revision <= maxRevisions; revision++ {
 		start := time.Now()
-		resp, callErr := chatClient.Chat(ctx, req)
+		result, err := driver.Drive(ctx, llm.DriveRequest{
+			System:         g.generateSystemToolUse,
+			Messages:       messages,
+			Tools:          tools,
+			Executor:       executor,
+			Provider:       g.provider,
+			SubmitToolName: submitScriptToolName,
+		})
 		duration := time.Since(start).Milliseconds()
-		// Record one session entry per chat turn so the trace shows
-		// the loop progression. The full system prompt is captured
-		// only on the first turn (it's stable across turns) — later
-		// turns just record the user/assistant deltas.
+
+		// One session record summarising this Drive call. Per-tool
+		// detail is captured separately via the tool_call records
+		// emitted below (one per Observation).
 		rec := session.Record{
 			Call:       "generate",
 			Provider:   g.provider,
 			Field:      n.Name,
 			DurationMS: duration,
 		}
-		if turn == 0 {
-			rec.SystemText = joinBlocks(req.System)
+		if revision == 0 {
+			rec.SystemText = joinBlocks(g.generateSystemToolUse)
 			rec.UserText = userText
 		}
-		if callErr != nil {
-			rec.Err = callErr.Error()
-			g.session.AppendCtx(ctx, rec)
-			return nil, fixtureSet, nil, fmt.Errorf("chat turn %d: %w", turn, callErr)
-		}
 		rec.Usage = &session.Usage{
-			InputTokens:         resp.Usage.InputTokens,
-			OutputTokens:        resp.Usage.OutputTokens,
-			CacheCreationTokens: resp.Usage.CacheCreationTokens,
-			CacheReadTokens:     resp.Usage.CacheReadTokens,
+			InputTokens:         result.Usage.InputTokens,
+			OutputTokens:        result.Usage.OutputTokens,
+			CacheCreationTokens: result.Usage.CacheCreationTokens,
+			CacheReadTokens:     result.Usage.CacheReadTokens,
 		}
-		// Render the assistant turn into the response field for
-		// debugging — text + tool calls.
-		respText := resp.Text
-		for _, tu := range resp.ToolUses {
-			tuJSON, _ := json.Marshal(tu.Input)
-			respText += fmt.Sprintf("\n[tool_use %s name=%s input=%s]", tu.ID, tu.Name, string(tuJSON))
+		if result.Submit != nil {
+			payload, _ := json.Marshal(result.Submit)
+			rec.Response = "[submit] " + string(payload)
+		} else if result.FinalText != "" {
+			rec.Response = result.FinalText
 		}
-		rec.Response = respText
+		if err != nil {
+			rec.Err = err.Error()
+		}
 		g.session.AppendCtx(ctx, rec)
 
-		logUsage("generate-toolloop", resp.Usage)
+		logUsage("generate-toolloop", result.Usage)
 		g.metrics.GenerateCalls++
-		g.metrics.GenerateInputTokens += resp.Usage.InputTokens
-		g.metrics.GenerateOutputTokens += resp.Usage.OutputTokens
-		g.metrics.CacheReadInputTokens += resp.Usage.CacheReadTokens
-		g.metrics.CacheCreationInputTokens += resp.Usage.CacheCreationTokens
+		g.metrics.GenerateInputTokens += result.Usage.InputTokens
+		g.metrics.GenerateOutputTokens += result.Usage.OutputTokens
+		g.metrics.CacheReadInputTokens += result.Usage.CacheReadTokens
+		g.metrics.CacheCreationInputTokens += result.Usage.CacheCreationTokens
 
-		if len(resp.ToolUses) == 0 {
-			return nil, fixtureSet, nil, fmt.Errorf("turn %d: model emitted text without calling any tool: %q", turn, truncate(resp.Text, 300))
+		// Capture observations as fixtures (translate name to
+		// script-side canonical: github_X) AND record one session
+		// tool_call entry per observation for trace fidelity.
+		fixtureSet = fixtureSet[:0]
+		for _, obs := range result.Observations {
+			scriptName := translateObservationName(obs.ToolName, g.provider)
+			fixtureSet.Append(scriptName, obs.Args, obs.Result)
+			g.session.AppendCtx(ctx, session.Record{
+				Call:     "tool_call",
+				Provider: g.provider,
+				Tool:     scriptName,
+				ToolArgs: obs.Args,
+				Result:   obs.Result,
+			})
 		}
 
-		messages = append(messages, llm.Message{
-			Role:     "assistant",
-			Text:     resp.Text,
-			ToolUses: resp.ToolUses,
-		})
+		if err != nil {
+			return nil, fixtureSet, nil, fmt.Errorf("drive tool-use loop: %w", err)
+		}
 
-		results := make([]llm.ToolResult, 0, len(resp.ToolUses))
-		var (
-			submittedOut      *llmOutput
-			submittedExpected any
-			submitFound       bool
+		if result.Submit == nil {
+			return nil, fixtureSet, nil, fmt.Errorf("model ended without calling submit_script (final text: %q)", truncate(result.FinalText, 300))
+		}
+
+		out, expected, perr := parseSubmitScript(result.Submit)
+		if perr != nil {
+			return nil, fixtureSet, nil, fmt.Errorf("parse submit_script: %w", perr)
+		}
+
+		diffMsg := g.verifySubmitted(ctx, n, out, expected, verifyArgs, parent, fixtureSet)
+		if diffMsg == "" {
+			return out, fixtureSet, expected, nil
+		}
+		if revision >= maxRevisions {
+			return nil, fixtureSet, nil, fmt.Errorf("verification failed after %d revision: %s", revision, diffMsg)
+		}
+		slog.Warn("plan: verification failed, requesting revision",
+			"field", n.Name,
+			"diff", truncate(diffMsg, 500),
 		)
-		for _, tu := range resp.ToolUses {
-			if tu.Name == submitScriptToolName {
-				out, expected, perr := parseSubmitScript(tu.Input)
-				if perr != nil {
-					results = append(results, llm.ToolResult{
-						ToolUseID: tu.ID,
-						Content:   "submit_script invalid: " + perr.Error(),
-						IsError:   true,
-					})
-					continue
-				}
-				submittedOut = out
-				submittedExpected = expected
-				submitFound = true
-				results = append(results, llm.ToolResult{
-					ToolUseID: tu.ID,
-					Content:   "received",
-				})
-				continue
-			}
-			// Real upstream tool call.
-			originalName := strings.TrimPrefix(tu.Name, mcpclient.HostNamePrefix)
-			callStart := time.Now()
-			result, callErr := g.mcp.Call(ctx, originalName, tu.Input)
-			toolRec := session.Record{
-				Call:       "tool_call",
-				Provider:   g.provider,
-				Tool:       tu.Name,
-				ToolArgs:   tu.Input,
-				DurationMS: time.Since(callStart).Milliseconds(),
-			}
-			if callErr != nil {
-				toolRec.Err = callErr.Error()
-				g.session.AppendCtx(ctx, toolRec)
-				results = append(results, llm.ToolResult{
-					ToolUseID: tu.ID,
-					Content:   callErr.Error(),
-					IsError:   true,
-				})
-				continue
-			}
-			toolRec.Result = result
-			g.session.AppendCtx(ctx, toolRec)
-			fixtureSet.Append(tu.Name, tu.Input, result)
-			payload, _ := json.Marshal(result)
-			content := string(payload)
-			if len(content) > 50000 {
-				content = content[:50000] + "\n... [truncated]"
-			}
-			results = append(results, llm.ToolResult{
-				ToolUseID: tu.ID,
-				Content:   content,
-			})
-		}
-
-		if submitFound {
-			// Append the submit acknowledgement (and any other
-			// in-turn tool results) so the message history stays
-			// well-formed for a possible revision turn.
-			messages = append(messages, llm.Message{
-				Role:        "user",
-				ToolResults: results,
-			})
-
-			diffMsg := g.verifySubmitted(ctx, n, submittedOut, submittedExpected, verifyArgs, parent, fixtureSet)
-			if diffMsg == "" {
-				return submittedOut, fixtureSet, submittedExpected, nil
-			}
-			if revisions >= maxRevisions {
-				return nil, fixtureSet, nil, fmt.Errorf("verification failed after %d revision: %s", revisions, diffMsg)
-			}
-			revisions++
-			slog.Warn("plan: verification failed, requesting revision",
-				"field", n.Name,
-				"diff", truncate(diffMsg, 500),
-			)
-			messages = append(messages, llm.Message{
-				Role: "user",
-				Text: "Verification failed. The script you submitted, run against the data you observed during exploration, did not match your expected_output:\n\n" + diffMsg + "\n\nReview your script and your expected_output. One of them is wrong (most often the script — defensive shape handling that returns null when a wrapper key was unexpected is a common cause). Call submit_script again with corrected values.",
-			})
-			continue
-		}
-
+		// Append a revision message — the next Drive call sees
+		// the original prompt + a "you got it wrong, try again"
+		// follow-up.
 		messages = append(messages, llm.Message{
-			Role:        "user",
-			ToolResults: results,
+			Role: "user",
+			Text: "Verification failed. The script you submitted, run against the data you observed during exploration, did not match your expected_output:\n\n" + diffMsg + "\n\nReview your script and your expected_output. One of them is wrong (most often the script — defensive shape handling that returns null when a wrapper key was unexpected is a common cause). Submit a corrected version.",
 		})
 	}
 
-	return nil, fixtureSet, nil, fmt.Errorf("tool-use loop hit %d turn limit without submit_script", maxToolUseTurns)
+	return nil, fixtureSet, nil, fmt.Errorf("tool-use revision budget exhausted")
+}
+
+// mcpToolExecutor adapts mcpclient.Client to the llm.ToolExecutor
+// interface. The tool name the model emitted may carry the SDK-side
+// `github_` prefix or the CLI-side `mcp__<provider>__` prefix; both
+// are stripped before calling upstream.
+type mcpToolExecutor struct {
+	client         *mcpclient.Client
+	prefix         string // e.g. "github_"
+	providerPrefix string // e.g. "mcp__atlassian__"
+}
+
+func (e *mcpToolExecutor) Call(ctx context.Context, name string, args map[string]any) (any, error) {
+	original := strings.TrimPrefix(name, e.prefix)
+	original = strings.TrimPrefix(original, e.providerPrefix)
+	return e.client.Call(ctx, original, args)
+}
+
+// translateObservationName maps a model-facing tool name back to the
+// script-side canonical name (`github_<X>`). Both backends emit
+// observations with model-facing names; fixtures use script-side
+// names so verification replay matches the script's host calls.
+func translateObservationName(name, provider string) string {
+	if strings.HasPrefix(name, mcpclient.HostNamePrefix) {
+		return name
+	}
+	if provider != "" {
+		prefix := "mcp__" + provider + "__"
+		if strings.HasPrefix(name, prefix) {
+			return mcpclient.HostNamePrefix + strings.TrimPrefix(name, prefix)
+		}
+	}
+	return mcpclient.HostNamePrefix + name
 }
 
 // verifySubmitted runs the submitted script with mocked capabilities
