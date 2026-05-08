@@ -54,7 +54,6 @@ type Generator struct {
 	monty                 *runtime.MontyEngine
 	caps                  *runtime.Capabilities
 	store                 *crystallize.Store
-	generateSystem        []llm.SystemBlock
 	generateSystemToolUse []llm.SystemBlock
 	normalizeSystem       []llm.SystemBlock
 	toolNames             []string // monty-side names like github_list_pull_requests
@@ -121,7 +120,6 @@ func NewGenerator(c *mcpclient.Client, store *crystallize.Store, llmClient llm.C
 		client:                llmClient,
 		mcp:                   c,
 		store:                 store,
-		generateSystem:        buildGenerateSystem(catalog),
 		generateSystemToolUse: buildGenerateSystemToolUse(catalog),
 		normalizeSystem:       buildNormalizeSystem(catalog),
 		toolNames:             c.MontyToolNames(),
@@ -134,9 +132,8 @@ func NewGenerator(c *mcpclient.Client, store *crystallize.Store, llmClient llm.C
 }
 
 // WithRunner attaches the monty engine and base capabilities used by
-// the tool-use GENERATE flow's verification step. Optional: when not
-// set (or when the LLM client doesn't support tool-use), Generate
-// falls back to single-turn fullGenerate.
+// the tool-use GENERATE flow's verification step. Required —
+// Generate errors out if no runner is wired.
 //
 // Returns the receiver so the constructor can be chained.
 func (g *Generator) WithRunner(monty *runtime.MontyEngine, caps *runtime.Capabilities) *Generator {
@@ -265,10 +262,11 @@ func (g *Generator) synthesizeProjection(n *engine.Node, parent any, rename *eng
 	// requested an object selection (e.g. `author { displayName }`
 	// where the parent script projected `author: "Dylan Etkin"`),
 	// the synthesized projection would emit `parent.get("displayName")`
-	// against a string and crash. Bail out and let fullGenerate
-	// write a script that handles the wrap (or refuses) — that path
-	// can return `{requested_field: parent}` when the parent IS the
-	// human-readable value the user asked for.
+	// against a string and crash. Bail out and let the tool-use
+	// generate path write a script that handles the wrap (or
+	// refuses) — that path can return `{requested_field: parent}`
+	// when the parent IS the human-readable value the user asked
+	// for.
 	switch parent.(type) {
 	case map[string]any, []any:
 		// fine — these are the shapes the synthesised projection
@@ -342,94 +340,6 @@ func (g *Generator) synthesizeProjection(n *engine.Node, parent any, rename *eng
 		"synthesized": true,
 	}
 	return script.String(), ioSchema, true
-}
-
-// Regenerate implements engine.ScriptRetryer. Called by the executor
-// when a previously-generated script errors at compile or run time
-// (typically a tool-call returning an upstream constraint violation
-// — e.g. Atlassian's "Unbounded JQL queries are not allowed here").
-//
-// We re-run the GENERATE prompt with the failed script and the
-// verbatim error appended as user-message context so the LLM can
-// adjust. The new script replaces the L2 cache entry — future calls
-// against this canonical hash get the fixed version directly without
-// paying for another retry.
-//
-// One retry per node (the executor caps at one). If the regeneration
-// itself fails or the new script also errors, we surface the
-// original error.
-func (g *Generator) Regenerate(ctx context.Context, n *engine.Node, parent any, prevScript, prevErr string) (string, *engine.NodeRename, error) {
-	// Reload state for this node — we need the canonical schema and
-	// rename that NORMALIZE produced earlier. They're already in
-	// the L2 cache (we wrote them on the first attempt).
-	shape := n.Shape()
-	literalHash := shape.L1Hash()
-	alias, ok, err := g.store.GetAlias(literalHash)
-	if err != nil || !ok {
-		return "", nil, fmt.Errorf("regenerate: no alias for shape %s (was the first attempt persisted?)", literalHash[:12])
-	}
-	entry, ok, err := g.store.GetEntry(alias.CanonicalHash)
-	if err != nil || !ok {
-		return "", nil, fmt.Errorf("regenerate: no L2 entry for canonical %s", alias.CanonicalHash[:12])
-	}
-
-	canon := canonicalSchema{}
-	if entry.CanonicalSchema != nil {
-		_ = json.Unmarshal(entry.CanonicalSchema, &canon)
-	}
-
-	userText, err := buildRetryPrompt(n, parent, &canon, prevScript, prevErr)
-	if err != nil {
-		return "", nil, fmt.Errorf("build retry prompt: %w", err)
-	}
-
-	slog.Info("plan: regenerating after script error",
-		"field", n.Name,
-		"canonical_hash", alias.CanonicalHash[:12],
-		"prev_err", truncate(prevErr, 200))
-
-	resp, err := g.callLLM(ctx, "regenerate", n.Name, g.generateSystem, userText)
-	if err != nil {
-		return "", nil, fmt.Errorf("regenerate llm call: %w", err)
-	}
-	out, err := parseLLMResponse(resp.Text)
-	if err != nil {
-		return "", nil, fmt.Errorf("parse regenerate response: %w", err)
-	}
-	g.metrics.GenerateCalls++
-	g.metrics.GenerateInputTokens += resp.Usage.InputTokens
-	g.metrics.GenerateOutputTokens += resp.Usage.OutputTokens
-
-	// Replace the L2 entry so subsequent calls skip the broken
-	// version. Alias unchanged — same literal-shape → same
-	// canonical hash.
-	entry.MontyScript = out.MontyScript
-	entry.IOSchema = out.IOSchema
-	if err := g.store.PutEntry(*entry); err != nil {
-		slog.Warn("plan: regenerated entry write failed", "err", err)
-	}
-	return out.MontyScript, alias.Rename, nil
-}
-
-// buildRetryPrompt extends the standard GENERATE user prompt with
-// the previous attempt's script and error. The LLM sees the original
-// task plus what just went wrong; the GENERATE system prompt's
-// instructions about output shape stay in force.
-func buildRetryPrompt(n *engine.Node, parent any, canon *canonicalSchema, prevScript, prevErr string) (string, error) {
-	original, err := buildUserPrompt(n, parent, canon)
-	if err != nil {
-		return "", err
-	}
-	var b strings.Builder
-	b.WriteString(original)
-	b.WriteString("\n\n## Previous attempt failed\n\n")
-	b.WriteString("Your earlier script:\n\n```python\n")
-	b.WriteString(prevScript)
-	b.WriteString("\n```\n\nFailed with:\n\n```\n")
-	b.WriteString(prevErr)
-	b.WriteString("\n```\n\n")
-	b.WriteString("The error message is verbatim from the upstream system; trust the constraint it describes. Generate a corrected script that respects it. Output the same JSON shape (monty_script + io_schema) as before.\n")
-	return b.String(), nil
 }
 
 func joinBlocks(blocks []llm.SystemBlock) string {
@@ -538,26 +448,21 @@ func (g *Generator) Generate(ctx context.Context, n *engine.Node, parent any) (s
 	// canonical-keyed script (other paraphrases reusing this script via L2
 	// will then see consistent canonical output).
 	//
-	// Two paths: tool-use (explore upstream → submit script → verify
-	// against fixtures) when the LLM client supports it AND a runner is
-	// wired; legacy single-turn fullGenerate otherwise. The tool-use
-	// path persists fixtures + expected_output on the entry; the
-	// legacy path leaves them empty.
-	var (
-		out            *llmOutput
-		fixtureSet     fixtures.Set
-		expectedOutput any
-	)
-	if _, isDriver := g.client.(llm.ToolUseDriver); isDriver && g.monty != nil && g.caps != nil {
-		out, fixtureSet, expectedOutput, err = g.fullGenerateToolUse(ctx, n, parent, canonSchema, rename)
-		if err != nil {
-			return "", nil, err
-		}
-	} else {
-		out, err = g.fullGenerate(ctx, n, parent, canonSchema)
-		if err != nil {
-			return "", nil, err
-		}
+	// Cold-cache GENERATE: explore-then-submit tool-use loop with
+	// fixture-replay verification. Both LLM backends (SDK + claude
+	// CLI) implement ToolUseDriver, and the runner is wired by
+	// pkg/genie at construction time.
+	driver, ok := g.client.(llm.ToolUseDriver)
+	if !ok {
+		return "", nil, fmt.Errorf("llm client does not implement ToolUseDriver")
+	}
+	if g.monty == nil || g.caps == nil {
+		return "", nil, fmt.Errorf("generator has no runner wired (call WithRunner)")
+	}
+	_ = driver // type-asserted above; fullGenerateToolUse re-asserts
+	out, fixtureSet, expectedOutput, err := g.fullGenerateToolUse(ctx, n, parent, canonSchema, rename)
+	if err != nil {
+		return "", nil, err
 	}
 
 	// Step 5: persist.
@@ -584,81 +489,6 @@ func (g *Generator) Generate(ctx context.Context, n *engine.Node, parent any) (s
 		slog.Warn("plan: L1 alias write failed", "err", err)
 	}
 	return out.MontyScript, rename, nil
-}
-
-// fullGenerate runs the GENERATE LLM call and parses the JSON response.
-// canon (from the prior normalize call) tells the LLM which canonical names
-// to use in the script's I/O — so any future L2 hit can reuse the script
-// with stable canonical-keyed args and outputs.
-func (g *Generator) fullGenerate(ctx context.Context, n *engine.Node, parent any, canon *canonicalSchema) (*llmOutput, error) {
-	userText, err := buildUserPrompt(n, parent, canon)
-	if err != nil {
-		return nil, fmt.Errorf("build user prompt: %w", err)
-	}
-
-	slog.Info("plan: full generate",
-		"field", n.Name,
-		"shape_hash", n.Shape().L1Hash()[:12],
-	)
-
-	resp, err := g.callLLM(ctx, "generate", n.Name, g.generateSystem, userText)
-	if err != nil {
-		return nil, fmt.Errorf("llm call: %w", err)
-	}
-	logUsage("generate", resp.Usage)
-	g.metrics.GenerateCalls++
-	g.metrics.GenerateInputTokens += resp.Usage.InputTokens
-	g.metrics.GenerateOutputTokens += resp.Usage.OutputTokens
-	g.metrics.CacheReadInputTokens += resp.Usage.CacheReadTokens
-	g.metrics.CacheCreationInputTokens += resp.Usage.CacheCreationTokens
-
-	out, err := parseLLMResponse(resp.Text)
-	if err != nil {
-		return nil, fmt.Errorf("parse llm response: %w (raw=%q)", err, truncate(resp.Text, 500))
-	}
-
-	// Pre-persist validation loop. The executor also runs
-	// ValidateScript (executor.go:resolveNode) before executing —
-	// but by then the bad script is already in L2. If we let it
-	// land, every paraphrase that L2-hits this canonical schema
-	// will pay an avoidable retry round-trip. Catch it here and
-	// regenerate with the violation as feedback so only a
-	// compliant script reaches PutEntry.
-	for attempt := 0; attempt < engine.RetryLimit(); attempt++ {
-		violation := engine.ValidateScript(out.MontyScript)
-		if violation == "" {
-			break
-		}
-		slog.Warn("plan: generated script violates static invariant; regenerating",
-			"field", n.Name,
-			"violation", violation,
-			"attempt", attempt+1,
-		)
-		retryText, berr := buildRetryPrompt(n, parent, canon, out.MontyScript, violation)
-		if berr != nil {
-			return nil, fmt.Errorf("build validation-retry prompt: %w", berr)
-		}
-		resp, err := g.callLLM(ctx, "regenerate", n.Name, g.generateSystem, retryText)
-		if err != nil {
-			return nil, fmt.Errorf("validation-retry llm call: %w", err)
-		}
-		logUsage("regenerate", resp.Usage)
-		g.metrics.GenerateCalls++
-		g.metrics.GenerateInputTokens += resp.Usage.InputTokens
-		g.metrics.GenerateOutputTokens += resp.Usage.OutputTokens
-		g.metrics.CacheReadInputTokens += resp.Usage.CacheReadTokens
-		g.metrics.CacheCreationInputTokens += resp.Usage.CacheCreationTokens
-		next, perr := parseLLMResponse(resp.Text)
-		if perr != nil {
-			return nil, fmt.Errorf("parse validation-retry response: %w", perr)
-		}
-		out = next
-	}
-	if violation := engine.ValidateScript(out.MontyScript); violation != "" {
-		return nil, fmt.Errorf("script validation failed after %d attempts: %s", engine.RetryLimit(), violation)
-	}
-
-	return out, nil
 }
 
 // submitScriptToolName is the synthetic Anthropic tool the model
@@ -1040,132 +870,13 @@ type llmOutput struct {
 	IOSchema    any    `json:"io_schema,omitempty"`
 }
 
-// parseLLMResponse extracts the JSON object from Claude's text response.
-// We instruct the model to return JSON only, but the SDK still returns
-// plain text — so we parse defensively. Three cases handled:
-//
-//  1. Body is bare JSON: parse it.
-//  2. Body is a single fenced block (```json ... ```): strip the fence.
-//  3. Body has prose THEN a fenced JSON block (Opus 4.7 in particular
-//     likes to write a "Looking at this..." preamble): extract the
-//     fenced block from anywhere in the body.
-//
-// Followed by the literal-control-char-escape fallback for the
-// once-in-a-while case where the model emits a real newline inside
-// a JSON string value.
-func parseLLMResponse(text string) (*llmOutput, error) {
-	body := strings.TrimSpace(text)
-	body = stripCodeFence(body)
-	body = extractJSONObject(body)
-
-	var out llmOutput
-	err := json.Unmarshal([]byte(body), &out)
-	if err != nil {
-		fixed := escapeUnescapedControlsInJSONStrings(body)
-		err = json.Unmarshal([]byte(fixed), &out)
-		if err != nil {
-			return nil, fmt.Errorf("unmarshal: %w", err)
-		}
-	}
-	if out.MontyScript == "" {
-		return nil, errors.New("missing monty_script field")
-	}
-	return &out, nil
-}
-
-// extractJSONObject finds the JSON object embedded in s. If s already
-// starts with `{`, returns s. Otherwise looks for a fenced JSON block
-// (```json ... ``` or just ``` ... ```) anywhere in the body and
-// returns its contents. As a last fallback, returns the substring
-// from the first `{` to the last `}` — the loosest valid extraction
-// that still produces parseable JSON for the common case where the
-// model wraps a JSON object in prose.
-func extractJSONObject(s string) string {
-	t := strings.TrimSpace(s)
-	if strings.HasPrefix(t, "{") {
-		return t
-	}
-	// Look for a code-fenced block.
-	if start := strings.Index(t, "```"); start >= 0 {
-		// Skip the opening fence + optional language tag.
-		afterFence := t[start+3:]
-		if nl := strings.IndexByte(afterFence, '\n'); nl >= 0 {
-			afterFence = afterFence[nl+1:]
-		}
-		if end := strings.Index(afterFence, "```"); end >= 0 {
-			inner := strings.TrimSpace(afterFence[:end])
-			if strings.HasPrefix(inner, "{") {
-				return inner
-			}
-		}
-	}
-	// Fallback: substring between the first `{` and the last `}`.
-	first := strings.IndexByte(t, '{')
-	last := strings.LastIndexByte(t, '}')
-	if first >= 0 && last > first {
-		return t[first : last+1]
-	}
-	return t
-}
-
-// escapeUnescapedControlsInJSONStrings walks the JSON body and replaces
-// any literal newline / carriage return / tab that appears INSIDE a string
-// value with its proper JSON escape. Outside string values these characters
-// are legal whitespace and are passed through unchanged.
-//
-// The walk tracks string-boundary state via a single boolean and respects
-// backslash escapes — when a backslash appears inside a string, the next
-// character is consumed verbatim so an already-escaped quote doesn't
-// confuse the parser.
-//
-// Bytes outside the ASCII range are passed through unchanged; the JSON
-// spec only flags chars < 0x20 inside strings, and runes are rebuilt at
-// unmarshal time.
-func escapeUnescapedControlsInJSONStrings(s string) string {
-	var b strings.Builder
-	b.Grow(len(s) + 16)
-	inString := false
-	escapeNext := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if !inString {
-			if c == '"' {
-				inString = true
-			}
-			b.WriteByte(c)
-			continue
-		}
-		if escapeNext {
-			b.WriteByte(c)
-			escapeNext = false
-			continue
-		}
-		switch c {
-		case '\\':
-			escapeNext = true
-			b.WriteByte(c)
-		case '"':
-			inString = false
-			b.WriteByte(c)
-		case '\n':
-			b.WriteString(`\n`)
-		case '\r':
-			b.WriteString(`\r`)
-		case '\t':
-			b.WriteString(`\t`)
-		default:
-			b.WriteByte(c)
-		}
-	}
-	return b.String()
-}
-
+// stripCodeFence drops a leading ```[lang]\n ... \n``` wrapper if
+// present. Used by NORMALIZE response parsing where the model
+// occasionally fences its JSON output.
 func stripCodeFence(s string) string {
 	if !strings.HasPrefix(s, "```") {
 		return s
 	}
-	// Drop opening fence (with optional language tag) and trailing fence.
-	// Format: ```[lang]\n<body>\n```
 	nl := strings.IndexByte(s, '\n')
 	if nl < 0 {
 		return s
@@ -1183,256 +894,15 @@ func truncate(s string, n int) string {
 	return s[:n] + "…"
 }
 
-// buildGenerateSystem assembles the system blocks for the GENERATE call:
-// the cacheable tool catalog (cache breakpoint) followed by the script-
-// generation instructions. The tool catalog renders deterministically so
-// the prompt cache hits across calls.
-//
-// IMPORTANT — DO NOT ADD PROVIDER-SPECIFIC TEXT.
-//
-// Genie is a generic MCP gateway. The exact same prompt is used to drive
-// scripts against GitHub, Atlassian, Linear, Slack, or any other MCP
-// server the user wires up. Provider-specific knowledge (tool names,
-// schema fields, response shapes) MUST come from the runtime-rendered
-// tool catalog (the first block) — never from hardcoded prose here.
-//
-// Examples in this prompt use abstract patterns (e.g. "items / records /
-// data" rather than specific field names like "pull_requests"). If you
-// catch yourself writing a specific tool name or schema field into the
-// preamble, stop — that knowledge belongs in the catalog block, which
-// comes from the upstream MCP server's actual tool list.
-//
-// CacheBreakAfter on BOTH blocks: the catalog and preamble are stable
-// across calls, so caching both saves ~12k tokens/call after the first.
-func buildGenerateSystem(catalog string) []llm.SystemBlock {
-	preamble := `You generate Python (Monty-on-WASM) scripts that resolve a single GraphQL node against the upstream MCP server's tools (the host-function catalog below).
-
-The script you produce is invoked by the engine as:
-
-    execute(args, parent)
-
-where:
-  - args   is a dict of the GraphQL field arguments at this node, with values already resolved to Python natives.
-  - parent is None for top-level nodes; for nodes inside a parent's selection set, it is the parent object as the parent's script returned it (a dict, or one element of a list the parent returned).
-
-Your script MUST define ` + "`def execute(args, parent):`" + ` and return:
-  - a list of dicts when the node represents a collection,
-  - a single dict when the node represents one entity,
-  - a scalar (str / int / bool) when the node is a scalar leaf.
-
-The engine handles selection projection: return whichever fields might plausibly be requested at this node — the engine drops anything not asked for in the requested selection set. Do NOT manually filter to the requested fields.
-
-The ONLY external surface available to the script is the host-function catalog below. Do not import requests, urllib, subprocess, os, threading, asyncio, etc. Do not call open(). The Monty sandbox does not provide them.
-
-## Project from parent when possible (avoid redundant tool calls)
-
-If ` + "`parent`" + ` is non-None and the requested fields look like simple projections of values already present in the parent dict, return ` + "`{key: parent.get(key) for key in requested_keys}`" + ` directly. Do NOT call host functions for data the parent already supplied. The engine reuses the parent script's output across all child nodes, so re-fetching is pure waste.
-
-## Do NOT swallow host-function errors
-
-When a host function raises (an upstream tool returned an error response), let the exception propagate. The executor catches it and gives you a chance to regenerate the script with the verbatim error in your next prompt — that's how you learn about constraints like "this query needs a filter argument" or "this field requires expand=X".
-
-DO NOT write:
-
-    try:
-        resp = some_tool(...)
-    except Exception:
-        resp = None   # ← swallows real errors, breaks the retry loop
-
-DO write:
-
-    resp = some_tool(...)   # let upstream errors propagate
-
-(Defensive shape handling on the SUCCESSFUL response is fine; see below.)
-
-## Sandbox Python constraints (verified)
-
-Monty is a forked Python-on-WASM. Most of the language works, but the following diverges from CPython. You MUST follow these rules — scripts that violate them crash at runtime and the cache entry is wasted.
-
-ALLOWED (verified working):
-  - All built-in types and operations (int, str, list, dict, tuple, set, bool, None)
-  - f-strings:  f"hello {name}"  — use these for formatting
-  - String methods: split, join, strip, lower, upper, replace, startswith, endswith, find, in, slicing
-  - List/dict/set comprehensions, sorted(), .sort(), isinstance()
-  - import json     — json.dumps, json.loads
-  - import re       — re.search, re.match, re.findall, etc.
-  - import datetime — but ONLY:
-      * datetime.datetime(year, month, day, ...)            — constructor
-      * datetime.datetime.fromisoformat("2024-01-01T...")    — parse ISO 8601
-      * datetime.timedelta(days=N, hours=N, ...)
-      * arithmetic on datetime/timedelta objects
-      * .isoformat(), .strftime() on datetime instances
-
-BANNED (will crash):
-  - "...".format(...)        — use f-strings instead
-  - "..." %% (a, b)          — use f-strings instead
-  - datetime.datetime.now()  — use the host helpers below
-  - datetime.datetime.utcnow()
-  - datetime.date.today()
-  - any network, file, subprocess, or threading API
-
-## Time host helpers
-
-For "current time" needs, call these host functions instead of any datetime
-clock API. They're regular host calls — no import needed.
-
-  - now_iso()             -> "2026-05-06T14:30:00Z"      RFC 3339, UTC
-  - now_epoch()           -> 1746541800                  unix seconds (int)
-  - days_ago_iso(n=7)     -> "2026-04-29T14:30:00Z"      RFC 3339, UTC, n days ago
-  - hours_ago_iso(n=24)   -> "2026-05-05T14:30:00Z"      RFC 3339, UTC, n hours ago
-
-When a query passes a numeric time arg like ` + "`days: 7`" + ` or ` + "`hours: 24`" + `,
-the value reaches your script as a Python int. Pass it directly:
-
-    n = args.get("days") or 7
-    since = days_ago_iso(n)            # works whether n is 7 (int) or 7.0 (float)
-
-Do NOT guard with ` + "`isinstance(x, str)`" + ` and skip the helper when the
-arg is numeric — the check fails for ints, the time clause silently
-drops, and the user's filter is ignored. Coerce explicitly if you
-need to:
-
-    n = args.get("days")
-    if isinstance(n, str):
-        n = int(n) if n.isdigit() else 7
-    elif not isinstance(n, (int, float)):
-        n = 7
-    since = days_ago_iso(int(n))
-
-## Hallucinated field names
-
-Hallucinated GraphQL field names are intentional: the user may request fields that do not exist on any real schema. Treat the field name as an intent signal — pick the closest sensible interpretation given the available tools and the arg list. If a requested field has no plausible mapping, return null for it; do not raise.
-
-## Match output shape to the GraphQL selection set
-
-The user's GraphQL selection tells you the SHAPE the script must return. Read the literal user node in your prompt and respect its structure:
-
-  - A bare scalar selection (` + "`{ login }`" + `) means return a value the engine can read at the field name. Object or string both work; the engine projects.
-  - A nested-object selection (` + "`{ author { displayName name } }`" + `) means the script's value at ` + "`author`" + ` MUST be a dict (or list of dicts), NOT a scalar. The engine recursively descends into the sub-object to project its children — if your script returned ` + "`author: \"Dylan Etkin\"`" + ` (string), the engine cannot extract ` + "`displayName`" + ` from that scalar and the user sees null.
-  - When the upstream tool only gives you the human-readable value at the parent level (e.g. you've already resolved an authorId to "Dylan Etkin"), wrap it: emit ` + "`author: {\"displayName\": \"Dylan Etkin\"}`" + ` so the nested selection has somewhere to project from.
-
-This applies to ` + "`expected_output`" + ` too: if your script returns nested objects, your expected_output's matching path must also be nested. Don't flatten in expected_output what the script keeps nested — verification compares them directly.
-
-Worked example:
-
-  Selection: ` + "`{ pages { title author { displayName } } }`" + `
-  WRONG return: ` + "`[{title: \"X\", author: \"Dylan Etkin\"}]`" + ` (author is a string; engine projects displayName from a string → null)
-  RIGHT return: ` + "`[{title: \"X\", author: {displayName: \"Dylan Etkin\"}}]`" + ` (engine descends into author, finds displayName)
-
-## Resolve opaque identifiers when a human-readable field is requested
-
-The user's selection often asks for human-readable fields (` + "`name`" + `, ` + "`displayName`" + `, ` + "`title`" + `, ` + "`label`" + `) at a position where the upstream tool's response only carries an opaque identifier (e.g. ` + "`authorId`" + `, ` + "`ownerId`" + `, ` + "`userId`" + `, ` + "`assigneeAccountId`" + `, ` + "`createdById`" + `). Returning the raw ID where a name was requested is a silent data bug — the caller can't tell, and the answer is unusable.
-
-When this happens, scan the catalog for a tool that resolves the ID kind to a record, and call it. Common naming patterns: ` + "`lookup_<kind>_id`" + `, ` + "`get_<kind>_by_id`" + `, ` + "`get_<kind>`" + `. Pick the one whose input schema accepts the opaque ID you have and whose output schema contains the human-readable field you need.
-
-Pseudocode:
-
-    raw_value = item.get("displayName") or item.get("name")
-    if raw_value and is_opaque_id(raw_value):
-        # The upstream returned just an ID; look up the record to get
-        # the actual name. The catalog has a tool for this — use it.
-        resolved = lookup_kind_by_id(id=raw_value)
-        if isinstance(resolved, dict):
-            raw_value = resolved.get("displayName") or resolved.get("name") or raw_value
-
-` + "`is_opaque_id(s)`" + ` is up to your judgement: typically a hex/uuid-shaped string, an all-digit string, or any value that obviously isn't a human name. When in doubt, attempt the lookup — if the catalog has no resolver tool, return the raw value as-is rather than raising.
-
-Cache the resolution within the script (one dict on the local function frame) so iterating a 50-item list doesn't make 50 round-trips for the same ID.
-
-## Parallel fan-out for independent host calls
-
-When iterating a list and making one host call per element with NO data dependency between iterations, batch the calls with the ` + "`parallel`" + ` host helper instead of walking the loop sequentially. Sequential N×400ms calls become ~400ms total once batched.
-
-Shape:
-
-    results = parallel([
-        {"fn": "host_function_name", "args": {"key": value_for_item_1}},
-        {"fn": "host_function_name", "args": {"key": value_for_item_2}},
-    ])
-    # results[i] is {"ok": <return-value>} or {"error": "<msg>"}.
-    # Same length and order as the input list.
-
-Optional second arg: ` + "`parallel(calls, max_concurrency=8)`" + ` — default 8 is fine for most upstream MCP servers.
-
-Use ` + "`parallel`" + ` ONLY when:
-  - Every call is independent (no call's args depend on another's result).
-  - The function is a host call (an in-process Python loop has nothing to gain).
-  - You're about to make at least 3 calls — fewer than that, the orchestration overhead exceeds the benefit.
-
-When ANY call errors, the whole batch still returns — inspect each result's "error" key. Treat a per-result error like a missing field on a single call: use the raw-value fallback or return null for that row, do NOT raise.
-
-DO NOT use ` + "`parallel`" + ` to call itself or to wrap pure-Python work. The function is for fanning out CATALOG-listed host functions only.
-
-## Defensive shape handling on SUCCESSFUL responses
-
-A cached script may be reused for a paraphrase where the response shape differs subtly. On a successful response (the call did not raise), defensively handle every plausible shape rather than assuming one.
-
-When a tool publishes an Output schema (in the catalog above), use it as the FIRST source of truth for navigation: walk the documented path to find the data list / object, rather than guessing wrapper keys. The defensive ladder below is the FALLBACK for when the schema is absent or the actual response diverges from it. Schemas can be deeply nested (e.g. ` + "`data.users.users[]`" + ` is a real shape) — don't assume the data list lives one level under the root just because that's the most common case.
-
-  - When you expect a list, accept any of:
-      * a bare ` + "`list`" + ` of dicts
-      * a ` + "`dict`" + ` whose value at one of common wrapper keys ({"items", "results", "data", "nodes", "values", "records"}, plus any wrapper key the actual tool's schema names) is the list
-      * an empty/None response
-    Pseudocode:
-        if isinstance(resp, list):
-            items = resp
-        elif isinstance(resp, dict):
-            items = resp.get("items") or resp.get("results") or resp.get("data") or resp.get("nodes") or resp.get("values") or resp.get("records") or []
-        else:
-            items = []
-
-  - When iterating the resolved list, SKIP non-dict elements:
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            ...
-
-  - When projecting nested objects, default to ` + "`{}`" + ` and use ` + "`.get()`" + `:
-        sub = (item.get("sub_obj") or {})
-        val = sub.get("name")
-
-  - On a single-object query, accept either a bare dict or a {"data": {...}} wrapper:
-        if isinstance(resp, dict) and "data" in resp and isinstance(resp["data"], dict):
-            obj = resp["data"]
-        else:
-            obj = resp if isinstance(resp, dict) else {}
-
-Never assume a key is present. Never assume a value is the type you expect. The engine treats a None at a missing field as "not requested" and that's fine.
-
-## Expand parameters
-
-Many tools return shallow records by default and require an explicit ` + "`expand=`" + `, ` + "`fields=`" + `, or ` + "`include=`" + ` argument to populate nested objects. If the tool's schema (above) lists fields under ` + "`_expandable`" + ` or notes that they require expansion, set the appropriate parameter rather than relying on ` + "`.get()`" + ` returning the value silently.
-
-## Output format
-
-Respond with a single JSON object, no prose, no markdown fence:
-
-    {
-      "monty_script": "def execute(args, parent):\n    ...",
-      "io_schema":    { "type": "...", ... }   // best-effort JSON-schema-ish description of what the script returns
-    }
-`
-
-	return []llm.SystemBlock{
-		{Text: catalog, CacheBreakAfter: true},
-		{Text: preamble, CacheBreakAfter: true},
-	}
-}
-
 // buildGenerateSystemToolUse is the system-prompt builder for the
 // explore-then-submit GENERATE flow. The model is given the catalog
 // as REAL Anthropic tools (added by the loop driver); it calls
 // upstream MCP tools to learn the response shapes, then calls a
 // synthetic submit_script tool to deliver the final script.
 //
-// The script-writing rules are the same as buildGenerateSystem
-// (Monty constraints, output format, etc.) — duplicating them here
-// rather than refactoring keeps the diff focused; if the spike
-// graduates we can extract the shared text.
-//
-// IMPORTANT — DO NOT ADD PROVIDER-SPECIFIC TEXT. Same rule as the
-// legacy prompt: provider knowledge comes from the catalog block
-// (rendered from the live MCP tool list), never hardcoded here.
+// IMPORTANT — DO NOT ADD PROVIDER-SPECIFIC TEXT. Provider knowledge
+// comes from the catalog block (rendered from the live MCP tool
+// list), never hardcoded here.
 func buildGenerateSystemToolUse(catalog string) []llm.SystemBlock {
 	preamble := `You generate Python (Monty-on-WASM) scripts that resolve a single GraphQL node against the upstream MCP server's tools (the host-function catalog below).
 
@@ -1601,7 +1071,7 @@ func renderToolCatalog(tools []mcp.Tool) string {
 //
 // IMPORTANT — DO NOT ADD PROVIDER-SPECIFIC TEXT.
 //
-// Same rule as buildGenerateSystem: this prompt drives normalize for ANY
+// Same rule as buildGenerateSystemToolUse: this prompt drives normalize for ANY
 // MCP server (GitHub, Atlassian, Linear, Slack, …). Provider-specific
 // canonical names come from the runtime-rendered tool catalog (the
 // first block); never hardcode mappings like "openPRs → pull_requests"
