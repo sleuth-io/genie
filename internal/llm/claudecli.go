@@ -243,8 +243,22 @@ func (c *claudeCLI) Drive(ctx context.Context, req DriveRequest) (LoopResult, er
 
 ## Backend-specific notes (claude CLI)
 
-Tool names appear with the `+"`mcp__%s__`"+` prefix. When the
-catalog or earlier examples mention a bare name, prefix it.
+### Tool names — DIFFERENT in chat vs in your script
+
+In THIS conversation you call tools as `+"`mcp__%s__<name>`"+` — that is
+how claude's MCP machinery exposes them. Use that exact prefix when
+calling tools in your turns.
+
+In the SCRIPT you submit, call tools as `+"`github_<name>`"+` — that is
+the host-function prefix the monty sandbox registers. The provider
+component is dropped in script-side names; the `+"`github_`"+` prefix is
+hardcoded regardless of which provider you're using.
+
+So: same upstream tool, two names. During exploration here you'd call
+`+"`mcp__%s__getX`"+`. Inside your monty_script, you write
+`+"`github_getX(...)`"+`.
+
+### Submit by emitting JSON, not by calling a tool
 
 The synthetic %q tool is NOT available as a real tool here. When
 you have finished exploring and would otherwise call it, terminate
@@ -255,7 +269,7 @@ by writing your FINAL assistant message as ONLY a JSON object:
 No prose around it. The first character of your final message must
 be `+"`{`"+` and the last must be `+"`}`"+`. Genie parses that
 message as the submission and runs verification.
-`, req.Provider, req.SubmitToolName, req.SubmitToolName)
+`, req.Provider, req.Provider, req.SubmitToolName, req.SubmitToolName)
 	}
 	args = append(args, "--system-prompt", sysBuilder.String())
 
