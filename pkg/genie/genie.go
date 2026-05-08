@@ -20,7 +20,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -389,6 +391,29 @@ func (g *Genie) Close() error {
 	return nil
 }
 
+// cacheTTL returns the per-entry max age applied at L2 read time.
+// Default 30 days. GENIE_CACHE_TTL_DAYS overrides; "0" disables.
+//
+// Together with the catalog-hash gate, TTL is the safety net that
+// keeps the "cached scripts produce the same answer as direct
+// tool-use" claim defensible across upstream API drift. Catalog-
+// hash catches schema-level changes immediately; TTL catches drift
+// that doesn't change the schema (rephrased fields, changed
+// defaults, new-but-unused tools).
+func cacheTTL() time.Duration {
+	const defaultDays = 30
+	v := os.Getenv("GENIE_CACHE_TTL_DAYS")
+	if v == "" {
+		return defaultDays * 24 * time.Hour
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		slog.Warn("genie: GENIE_CACHE_TTL_DAYS invalid, using default", "value", v, "default", defaultDays)
+		return defaultDays * 24 * time.Hour
+	}
+	return time.Duration(n) * 24 * time.Hour
+}
+
 func buildProviderBundle(name string, client *mcpclient.Client, monty *runtime.MontyEngine, llmClient llm.Client, cacheRoot string, sess *session.Session) *providerBundle {
 	mcpFuncs, mcpParams := mcpclient.BuildHostFunctions(client)
 	for fname, inner := range mcpFuncs {
@@ -411,7 +436,10 @@ func buildProviderBundle(name string, client *mcpclient.Client, monty *runtime.M
 		Limits:        runtime.Limits{MaxDuration: 60 * time.Second},
 	}
 
-	store := crystallize.NewStore(filepath.Join(cacheRoot, name))
+	catalogHash := crystallize.HashCatalog(client.Tools())
+	store := crystallize.NewStore(filepath.Join(cacheRoot, name)).
+		WithCatalogHash(catalogHash).
+		WithTTL(cacheTTL())
 	gen := plan.NewGenerator(client, store, llmClient, name, sess).WithRunner(monty, caps)
 	ex := engine.NewExecutor(monty, caps, store).WithGenerator(gen)
 

@@ -50,8 +50,18 @@ type Entry struct {
 	// produce — used by the verification step to deep-diff the
 	// script's actual output. Stored on success so future
 	// regenerations can pin the same expectation.
-	ExpectedOutput any       `json:"expected_output,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
+	ExpectedOutput any `json:"expected_output,omitempty"`
+	// CatalogHash is a fingerprint of the upstream provider's tool
+	// catalog (names + descriptions + input/output schemas) at the
+	// moment this entry was generated. On read, the Store compares
+	// this against the current connect-time hash; mismatch means the
+	// upstream surface has changed and the cached script may produce
+	// wrong output, so we treat the entry as a miss and force a
+	// fresh GENERATE. Empty for entries written before this field
+	// existed — those count as a mismatch against any non-empty
+	// current hash, which is the right outcome (re-generate).
+	CatalogHash string    `json:"catalog_hash,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // Alias is the literal-shape-keyed pointer record. Multiple aliases can
@@ -67,14 +77,51 @@ type Alias struct {
 }
 
 // Store reads and writes Alias/Entry files under a root directory.
+//
+// Two optional read-time gates protect against stale cache entries:
+//
+//   - CatalogHash: when set, GetEntry returns a miss for entries
+//     whose own CatalogHash differs. The hash is a fingerprint of
+//     the upstream provider's tool surface (names + descriptions +
+//     input/output schemas); a difference signals an API change
+//     since the entry was generated. The caller wires this via
+//     WithCatalogHash at provider connect time.
+//   - TTL: when non-zero, GetEntry returns a miss for entries older
+//     than the duration. Floor against silent drift inside an
+//     unchanged catalog. Caller wires via WithTTL.
+//
+// Both gates are filters on read; they don't delete files. Stale
+// entries get overwritten naturally on the next GENERATE for the
+// same canonical hash.
 type Store struct {
-	Root string
+	Root        string
+	catalogHash string
+	ttl         time.Duration
 }
 
 // NewStore returns a Store rooted at `root` (typically "./crystallized").
 func NewStore(root string) *Store {
 	return &Store{Root: root}
 }
+
+// WithCatalogHash attaches the upstream-catalog fingerprint that
+// new entries are stamped with and existing entries are checked
+// against. Empty string disables the gate (older entries pass through).
+func (s *Store) WithCatalogHash(h string) *Store {
+	s.catalogHash = h
+	return s
+}
+
+// WithTTL attaches a max age for cached entries. Zero disables the
+// gate (entries never expire by age).
+func (s *Store) WithTTL(d time.Duration) *Store {
+	s.ttl = d
+	return s
+}
+
+// CatalogHash returns the hash the Store is currently filtering on.
+// Used by the Generator to stamp new entries.
+func (s *Store) CatalogHash() string { return s.catalogHash }
 
 // ResolveLiteral returns the cached script for a literal shape via the
 // L1 alias path, doing two cheap disk reads. Returns ("", false) on a clean
@@ -119,6 +166,15 @@ func (s *Store) GetAlias(hash string) (*Alias, bool, error) {
 }
 
 // GetEntry reads an L2 entry file. Missing → (nil, false, nil).
+//
+// Two read-time filters apply when configured (see Store doc):
+//   - CatalogHash mismatch: entry was generated against a different
+//     upstream API surface; treat as miss to force a fresh GENERATE.
+//   - TTL exceeded: entry is older than the configured ceiling; same
+//     treatment.
+//
+// In either case the file is left in place and overwritten naturally
+// on the next PutEntry for this canonical hash.
 func (s *Store) GetEntry(canonicalHash string) (*Entry, bool, error) {
 	path := s.l2Path(canonicalHash)
 	data, err := os.ReadFile(path)
@@ -131,6 +187,12 @@ func (s *Store) GetEntry(canonicalHash string) (*Entry, bool, error) {
 	var entry Entry
 	if err := json.Unmarshal(data, &entry); err != nil {
 		return nil, false, fmt.Errorf("decode %s: %w", path, err)
+	}
+	if s.catalogHash != "" && entry.CatalogHash != s.catalogHash {
+		return nil, false, nil
+	}
+	if s.ttl > 0 && !entry.CreatedAt.IsZero() && time.Since(entry.CreatedAt) > s.ttl {
+		return nil, false, nil
 	}
 	return &entry, true, nil
 }
@@ -148,12 +210,17 @@ func (s *Store) PutAlias(literalHash, canonicalHash string, rename *engine.NodeR
 }
 
 // PutEntry writes an L2 entry keyed by canonical hash. Idempotent.
+// The Store's current CatalogHash is stamped onto the entry if not
+// already set, so the read-side gate can detect drift on next access.
 func (s *Store) PutEntry(entry Entry) error {
 	if entry.CanonicalHash == "" {
 		return errors.New("PutEntry: empty canonical_hash")
 	}
 	if entry.CreatedAt.IsZero() {
 		entry.CreatedAt = time.Now().UTC()
+	}
+	if entry.CatalogHash == "" {
+		entry.CatalogHash = s.catalogHash
 	}
 	return s.writeJSON(s.l2Path(entry.CanonicalHash), entry)
 }
