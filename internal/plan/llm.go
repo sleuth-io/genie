@@ -1523,6 +1523,30 @@ The user may request fields that don't exist on any real schema. Treat the field
 
 When the response only carries an opaque identifier (an authorId, ownerId, userId, or similar) but the user asked for a human-readable field (name, displayName, title), look in the catalog for a resolver tool — typically named ` + "`lookup_<kind>_id`" + `, ` + "`get_<kind>_by_id`" + `, etc. Call it during exploration to verify it returns what you expect, then have your script call it too. Cache the resolution within the script (one dict on the local function frame) so iterating a 50-item list doesn't make 50 round-trips.
 
+## Parallel fan-out for independent host calls
+
+When iterating a list and making one host call per element with NO data dependency between iterations, batch the calls with the ` + "`parallel`" + ` host helper. Sequential N×400ms calls become ~400ms total once batched.
+
+Shape:
+
+    results = parallel([
+        {"fn": "host_function_name", "args": {"key": value_for_item_1}},
+        {"fn": "host_function_name", "args": {"key": value_for_item_2}},
+    ])
+    # results[i] is {"ok": <return-value>} or {"error": "<msg>"}.
+    # Same length and order as the input list.
+
+Optional: ` + "`parallel(calls, max_concurrency=8)`" + ` — default 8.
+
+Use ` + "`parallel`" + ` when:
+  - Each call is independent (no call's args depend on another's result).
+  - The function is a host call (an in-process Python loop has nothing to gain).
+  - You're about to make at least 3 calls.
+
+When ANY call errors, the whole batch still returns — inspect each result's "error" key. Treat a per-result error like a missing field on a single call: use a fallback or return null for that row, do NOT raise.
+
+DO NOT use ` + "`parallel`" + ` to call itself or for pure-Python work.
+
 ## What goes in expected_output
 
 When you call ` + "`submit_script`" + `, ` + "`expected_output`" + ` is the SHAPE the engine will compare against. Provide the FIRST 1-3 elements of what your script will return given the data you observed. The engine compares structurally — extra keys in actual output are fine, but missing keys or wrong types fail. Don't include keys you can't predict (e.g. updated timestamps if your script returns the raw upstream value); use null for fields you genuinely expect to be null.
