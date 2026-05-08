@@ -549,10 +549,16 @@ func (s *cliStreamReader) handleResult(line string) {
 // observed. Best-effort: if the text decodes as JSON, return that;
 // otherwise return the raw concatenated text. Non-text blocks (e.g.
 // images) pass through as their decoded structure.
+//
+// Some MCP servers return JSON-encoded strings inside their text
+// blocks (the text value is itself the JSON-quoted string of the
+// payload, not the payload directly). One pass of json.Unmarshal
+// returns just a Go string in that case; we re-parse if the result
+// is still a string that LOOKS like JSON.
 func unwrapToolResult(content any) any {
 	arr, ok := content.([]any)
 	if !ok {
-		return content
+		return decodeIfJSONString(content)
 	}
 	var concat strings.Builder
 	for _, item := range arr {
@@ -569,12 +575,33 @@ func unwrapToolResult(content any) any {
 	if concat.Len() == 0 {
 		return content
 	}
-	body := concat.String()
-	var parsed any
-	if err := json.Unmarshal([]byte(body), &parsed); err == nil {
-		return parsed
+	return decodeIfJSONString(concat.String())
+}
+
+// decodeIfJSONString tries to parse v (when it's a string) as JSON
+// and returns the parsed value when successful. Recurses up to a
+// small depth so doubly-encoded payloads ("\"...\"") fully unwrap.
+// Non-string inputs and parse failures pass through unchanged.
+func decodeIfJSONString(v any) any {
+	for i := 0; i < 4; i++ {
+		s, isStr := v.(string)
+		if !isStr {
+			return v
+		}
+		trim := strings.TrimSpace(s)
+		if !strings.HasPrefix(trim, "{") && !strings.HasPrefix(trim, "[") && !strings.HasPrefix(trim, `"`) {
+			return v
+		}
+		var parsed any
+		if err := json.Unmarshal([]byte(trim), &parsed); err != nil {
+			return v
+		}
+		v = parsed
+		if _, again := v.(string); !again {
+			return v
+		}
 	}
-	return body
+	return v
 }
 
 // parseSubmitFromText extracts the submit-tool input JSON the model
