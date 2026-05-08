@@ -75,6 +75,83 @@ func (s *Set) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// MergeFor returns a single merged response covering every capture
+// for the named tool. The merge rule:
+//
+//   - 0 captures → (nil, false).
+//   - 1 capture → the capture itself.
+//   - N captures → recursive merge: lists concat, dicts deep-merge
+//     (later captures' keys override on scalar conflict), other
+//     types fall back to the latest.
+//
+// Why this matters for verification: the model's exploration phase
+// often makes many small calls (resolve user A, then resolve user
+// B, …) while the script the model SUBMITS may make one bigger
+// call (resolve [A, B] in one batch) — or vice versa. Replay would
+// give the wrong-shape result if it returned only the latest
+// capture. Merging every capture for the tool name lets the
+// script's calls see the union of data the model observed,
+// regardless of how either side chose to batch.
+func (s Set) MergeFor(tool string) (any, bool) {
+	results := make([]any, 0)
+	for _, f := range s {
+		if f.Tool == tool {
+			results = append(results, f.Response)
+		}
+	}
+	if len(results) == 0 {
+		return nil, false
+	}
+	if len(results) == 1 {
+		return results[0], true
+	}
+	return mergeResults(results), true
+}
+
+func mergeResults(results []any) any {
+	if len(results) == 0 {
+		return nil
+	}
+	if len(results) == 1 {
+		return results[0]
+	}
+	allLists := true
+	for _, r := range results {
+		if _, ok := r.([]any); !ok {
+			allLists = false
+			break
+		}
+	}
+	if allLists {
+		var out []any
+		for _, r := range results {
+			out = append(out, r.([]any)...)
+		}
+		return out
+	}
+	allDicts := true
+	for _, r := range results {
+		if _, ok := r.(map[string]any); !ok {
+			allDicts = false
+			break
+		}
+	}
+	if allDicts {
+		out := map[string]any{}
+		for _, r := range results {
+			for k, v := range r.(map[string]any) {
+				if existing, present := out[k]; present {
+					out[k] = mergeResults([]any{existing, v})
+				} else {
+					out[k] = v
+				}
+			}
+		}
+		return out
+	}
+	return results[len(results)-1]
+}
+
 // ReplayCapabilities returns a copy of caps whose BuiltIns are
 // wrapped to consult the fixture set first.
 //
@@ -100,7 +177,7 @@ func ReplayCapabilities(caps *runtime.Capabilities, set Set, upstreamTools []str
 	}
 	wrapped := make(map[string]runtime.GoFunc, len(caps.BuiltIns))
 	for name, fn := range caps.BuiltIns {
-		if captured, ok := set.LatestFor(name); ok {
+		if captured, ok := set.MergeFor(name); ok {
 			wrapped[name] = staticReplay(captured)
 			continue
 		}
