@@ -28,6 +28,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 
 	"github.com/sleuth-io/genie/internal/runtime"
 )
@@ -129,10 +130,22 @@ func (s Set) LookupFor(tool string, args map[string]any) (any, bool) {
 		}
 		got, _ := json.Marshal(f.Args)
 		if string(got) == string(wanted) {
+			slog.Debug("fixtures: exact match", "tool", tool, "args_len", len(string(wanted)))
 			return f.Response, true
 		}
 	}
+	slog.Warn("fixtures: no exact-args match, falling back to merge",
+		"tool", tool,
+		"wanted", truncStr(string(wanted), 200),
+	)
 	return s.MergeFor(tool)
+}
+
+func truncStr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 func mergeResults(results []any) any {

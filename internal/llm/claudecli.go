@@ -578,42 +578,64 @@ func unwrapToolResult(content any) any {
 }
 
 // parseSubmitFromText extracts the submit-tool input JSON the model
-// emitted as its final assistant text. Accepts either:
+// emitted as its final assistant text. Handles the cases observed
+// in real claude CLI output:
+//
 //   - a bare object: {"<submit>": {...}}  — direct submission shape
-//   - a fenced block surrounding such an object
-//   - a bare object with the submit fields at the top level (when the
-//     model omits the wrapper)
+//   - prose + a fenced JSON block
+//   - prose + a fenced block with backticks but no language tag
+//   - MULTIPLE JSON blocks back-to-back (the model occasionally
+//     emits two consecutive submit_script objects, sometimes the
+//     same content twice, sometimes a "fix" of the first). We use
+//     the LAST one as the authoritative submission.
+//   - a bare object with the submit fields at the top level (when
+//     the model omits the wrapper)
 //
 // Returns nil when nothing parseable is present, signalling the
 // caller to surface the text as an error.
 func parseSubmitFromText(text, submitToolName string) map[string]any {
 	body := strings.TrimSpace(text)
-	// Strip a leading ``` fence if present.
-	if strings.HasPrefix(body, "```") {
-		if nl := strings.IndexByte(body, '\n'); nl >= 0 {
-			body = body[nl+1:]
-		}
-		body = strings.TrimSuffix(body, "```")
-		body = strings.TrimSpace(body)
-	}
-	// Find the first { and the last } — strip any surrounding prose.
-	if first := strings.IndexByte(body, '{'); first >= 0 {
-		if last := strings.LastIndexByte(body, '}'); last > first {
-			body = body[first : last+1]
-		}
-	}
-	var raw map[string]any
-	if err := json.Unmarshal([]byte(body), &raw); err != nil {
-		slog.Debug("claude cli: submit parse failed", "err", err)
+	// Skip past prose to the first `{`. Everything before that is
+	// thinking aloud.
+	first := strings.IndexByte(body, '{')
+	if first < 0 {
 		return nil
 	}
-	// Pattern 1: {"submit_script": {...}}
-	if inner, ok := raw[submitToolName].(map[string]any); ok {
-		return inner
+	body = body[first:]
+
+	// Decode every consecutive top-level JSON object. The decoder
+	// stops at junk between objects (e.g. ``` fence markers,
+	// blank lines); skip past them and continue.
+	var lastSubmit map[string]any
+	for len(body) > 0 {
+		dec := json.NewDecoder(strings.NewReader(body))
+		var raw map[string]any
+		err := dec.Decode(&raw)
+		consumed := dec.InputOffset()
+		if err == nil {
+			if inner, ok := raw[submitToolName].(map[string]any); ok {
+				lastSubmit = inner
+			} else if _, ok := raw["monty_script"]; ok {
+				lastSubmit = raw
+			} else if _, ok := raw["script"]; ok {
+				// Bare-fields shape with the "script" alias.
+				lastSubmit = raw
+			}
+			body = body[consumed:]
+		} else {
+			// Decoder couldn't parse here — skip to the next `{`
+			// and try again. If none, give up.
+			body = body[1:]
+		}
+		// Trim leading non-`{` characters.
+		next := strings.IndexByte(body, '{')
+		if next < 0 {
+			break
+		}
+		body = body[next:]
 	}
-	// Pattern 2: bare submit fields {"monty_script": "...", ...}
-	if _, ok := raw["monty_script"]; ok {
-		return raw
+	if lastSubmit == nil {
+		slog.Debug("claude cli: submit parse — no submission JSON found in final text")
 	}
-	return nil
+	return lastSubmit
 }
