@@ -177,7 +177,16 @@ func (a *anthropicClient) Chat(ctx context.Context, req ChatRequest) (ChatRespon
 		case anthropic.ToolUseBlock:
 			input := map[string]any{}
 			if len(b.Input) > 0 {
+				// Unmarshal can leave input as nil if the model
+				// emitted `"input": null` (common for tools with
+				// no parameters). Re-init to empty map so the
+				// caller-side echo doesn't serialize back as
+				// "null", which the API rejects with
+				// `tool_use.input: Input should be an object`.
 				_ = json.Unmarshal(b.Input, &input)
+				if input == nil {
+					input = map[string]any{}
+				}
 			}
 			resp.ToolUses = append(resp.ToolUses, ToolUse{
 				ID:    b.ID,
@@ -317,7 +326,15 @@ func convertMessage(m Message) (anthropic.MessageParam, error) {
 			blocks = append(blocks, anthropic.NewTextBlock(m.Text))
 		}
 		for _, tu := range m.ToolUses {
-			input, err := json.Marshal(tu.Input)
+			// Anthropic's tool_use.input must be a JSON object,
+			// never null. Coerce nil/empty inputs to {} so a
+			// model that called a parameterless tool round-trips
+			// safely on the next turn.
+			inputVal := tu.Input
+			if inputVal == nil {
+				inputVal = map[string]any{}
+			}
+			input, err := json.Marshal(inputVal)
 			if err != nil {
 				return anthropic.MessageParam{}, fmt.Errorf("marshal tool_use input: %w", err)
 			}
