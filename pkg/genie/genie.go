@@ -451,6 +451,25 @@ func buildProviderBundle(name string, client *mcpclient.Client, monty *runtime.M
 			Params map[string][]string
 		}{Funcs: clockFuncs, Params: clockParams},
 	)
+	// `parallel` is registered AFTER the merge: its lookup closure
+	// captures the merged map so a fan-out can dispatch to any
+	// upstream tool (already wrapped by wrapToolFunc, so session
+	// recording flows through). Self-call into `parallel` is
+	// blocked at runtime — see internal/sandbox/parallel.go.
+	parallelFuncs, parallelParams := sandbox.BuildParallelBuiltins(func(n string) (runtime.GoFunc, bool) {
+		fn, ok := builtIns[n]
+		return fn, ok
+	})
+	builtIns, params = sandbox.MergeBuiltins(
+		struct {
+			Funcs  map[string]runtime.GoFunc
+			Params map[string][]string
+		}{Funcs: builtIns, Params: params},
+		struct {
+			Funcs  map[string]runtime.GoFunc
+			Params map[string][]string
+		}{Funcs: parallelFuncs, Params: parallelParams},
+	)
 	caps := &runtime.Capabilities{
 		BuiltIns:      builtIns,
 		BuiltInParams: params,

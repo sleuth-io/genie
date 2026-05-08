@@ -1339,6 +1339,30 @@ Pseudocode:
 
 Cache the resolution within the script (one dict on the local function frame) so iterating a 50-item list doesn't make 50 round-trips for the same ID.
 
+## Parallel fan-out for independent host calls
+
+When iterating a list and making one host call per element with NO data dependency between iterations, batch the calls with the ` + "`parallel`" + ` host helper instead of walking the loop sequentially. Sequential N×400ms calls become ~400ms total once batched.
+
+Shape:
+
+    results = parallel([
+        {"fn": "host_function_name", "args": {"key": value_for_item_1}},
+        {"fn": "host_function_name", "args": {"key": value_for_item_2}},
+    ])
+    # results[i] is {"ok": <return-value>} or {"error": "<msg>"}.
+    # Same length and order as the input list.
+
+Optional second arg: ` + "`parallel(calls, max_concurrency=8)`" + ` — default 8 is fine for most upstream MCP servers.
+
+Use ` + "`parallel`" + ` ONLY when:
+  - Every call is independent (no call's args depend on another's result).
+  - The function is a host call (an in-process Python loop has nothing to gain).
+  - You're about to make at least 3 calls — fewer than that, the orchestration overhead exceeds the benefit.
+
+When ANY call errors, the whole batch still returns — inspect each result's "error" key. Treat a per-result error like a missing field on a single call: use the raw-value fallback or return null for that row, do NOT raise.
+
+DO NOT use ` + "`parallel`" + ` to call itself or to wrap pure-Python work. The function is for fanning out CATALOG-listed host functions only.
+
 ## Defensive shape handling on SUCCESSFUL responses
 
 A cached script may be reused for a paraphrase where the response shape differs subtly. On a successful response (the call did not raise), defensively handle every plausible shape rather than assuming one.
