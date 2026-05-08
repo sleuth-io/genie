@@ -207,13 +207,29 @@ func (c *claudeCLI) Drive(ctx context.Context, req DriveRequest) (LoopResult, er
 		"--disable-slash-commands",
 	}
 
-	// Restrict the model to upstream-provider tools (the user's
-	// claude-code MCP setup must include the same provider for
-	// these to be present).
-	if req.Provider != "" {
-		args = append(args, "--allowedTools", "mcp__"+req.Provider+"__*")
-	} else {
-		args = append(args, "--allowedTools", "")
+	// Restrict the model to upstream-provider tools. claude's
+	// --allowedTools doesn't support `mcp__<provider>__*` wildcards
+	// (the syntax is positive list of exact names), so we
+	// enumerate the tools we know about from req.Tools, prefixing
+	// each with `mcp__<provider>__`. The synthetic SubmitToolName
+	// has no claude-side counterpart and is omitted.
+	if req.Provider != "" && len(req.Tools) > 0 {
+		names := make([]string, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			if t.Name == req.SubmitToolName {
+				continue
+			}
+			// Strip Genie's monty-side prefix (e.g. github_) before
+			// applying claude's mcp__<provider>__ prefix.
+			bare := t.Name
+			if i := strings.Index(bare, "_"); i >= 0 && bare[:i+1] == "github_" {
+				bare = bare[i+1:]
+			}
+			names = append(names, "mcp__"+req.Provider+"__"+bare)
+		}
+		if len(names) > 0 {
+			args = append(args, "--allowedTools", strings.Join(names, ","))
+		}
 	}
 
 	// Build the system prompt: existing blocks + a CLI-specific coda.

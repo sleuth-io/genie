@@ -961,10 +961,16 @@ func sanitizeToolName(s string) string {
 }
 
 // parseSubmitScript extracts the script + expected_output + io_schema
-// from the submit_script tool call's input.
+// from the submit_script tool call's input. Accepts either
+// "monty_script" (the canonical key) or the "script" alias the model
+// occasionally uses when paraphrasing — the prompt names the key
+// explicitly but a forgiving parser is cheap insurance.
 func parseSubmitScript(input map[string]any) (*llmOutput, any, error) {
-	script, ok := input["monty_script"].(string)
-	if !ok || script == "" {
+	script, _ := input["monty_script"].(string)
+	if script == "" {
+		script, _ = input["script"].(string)
+	}
+	if script == "" {
 		return nil, nil, errors.New("monty_script missing or not a string")
 	}
 	out := &llmOutput{
