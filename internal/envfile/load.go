@@ -20,12 +20,19 @@ import (
 // environment. A missing file is fine (returns nil). Existing env
 // vars take precedence over file contents.
 func Load() error {
-	f, err := os.Open(".env")
+	return LoadPath(".env")
+}
+
+// LoadPath reads the named env file and applies it to the process
+// environment. Same semantics as Load: missing file is fine,
+// existing env wins over file contents.
+func LoadPath(path string) error {
+	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return fmt.Errorf("open .env: %w", err)
+		return fmt.Errorf("open %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
 
