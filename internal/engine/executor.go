@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/sleuth-io/genie/internal/runtime"
 )
@@ -119,13 +121,23 @@ func (e *Executor) WithGenerator(gen ScriptGenerator) *Executor {
 func (e *Executor) Execute(ctx context.Context, q *Query) (map[string]any, error) {
 	memo := map[string]any{}
 	out := map[string]any{}
+	t0 := time.Now()
 	for _, n := range q.TopLevel {
+		nodeStart := time.Now()
 		v, err := e.resolveNode(ctx, n, nil, nil, memo)
+		slog.Info("engine.resolveNode top-level",
+			"field", n.Name,
+			"dur_ms", time.Since(nodeStart).Milliseconds(),
+		)
 		if err != nil {
 			return nil, err
 		}
 		out[n.AliasOrName()] = v
 	}
+	slog.Info("engine.Execute done",
+		"top_level_count", len(q.TopLevel),
+		"total_ms", time.Since(t0).Milliseconds(),
+	)
 	return out, nil
 }
 
@@ -224,11 +236,21 @@ func (e *Executor) resolveNode(
 		err = errors.New(violation)
 	} else {
 		var mod runtime.Module
+		compileStart := time.Now()
 		mod, err = e.eng.Compile(src)
+		compileDur := time.Since(compileStart)
+		var runDur time.Duration
 		if err == nil {
+			runStart := time.Now()
 			raw, _, err = e.eng.Run(ctx, mod, "execute",
 				map[string]any{"args": argMap, "parent": parent}, e.caps)
+			runDur = time.Since(runStart)
 		}
+		slog.Info("engine.script",
+			"field", n.Name,
+			"compile_ms", compileDur.Milliseconds(),
+			"run_ms", runDur.Milliseconds(),
+		)
 	}
 	// LLM-driven retry loop: each attempt feeds the previous
 	// script + error to the generator so it can iterate. The

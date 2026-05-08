@@ -79,7 +79,17 @@ func runQueryTool(lister ProviderLister) mcp.Tool {
 
 func runQueryHandler(srv *server.MCPServer, runner QueryRunner, lister ProviderLister) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// Phase timing: record entry/exit of every observable step
+		// in the MCP-side wrapper so the caller-side wall-time can
+		// be attributed across (1) MCP arg parsing, (2) the runner
+		// — all of genie's internal work, also instrumented inside —
+		// and (3) result marshaling. Anything outside [t0, marshal_done]
+		// is transport overhead between the caller (claude code's
+		// MCP client) and this server.
+		t0 := time.Now()
 		args := req.GetArguments()
+		slog.Info("mcp.runquery: handler entry",
+			"args_dur_us", time.Since(t0).Microseconds())
 
 		provider, _ := args["provider"].(string)
 		if provider == "" {
@@ -99,15 +109,27 @@ func runQueryHandler(srv *server.MCPServer, runner QueryRunner, lister ProviderL
 
 		ctx = withProgressFromRequest(ctx, srv, req)
 
+		runnerStart := time.Now()
 		result, err := runner(ctx, provider, query)
+		runnerDur := time.Since(runnerStart)
 		if err != nil {
+			slog.Info("mcp.runquery: runner errored", "runner_ms", runnerDur.Milliseconds(), "err", err)
 			return mcp.NewToolResultError(fmt.Sprintf("resolution failed: %v", err)), nil
 		}
 
+		marshalStart := time.Now()
 		buf, err := json.MarshalIndent(result, "", "  ")
+		marshalDur := time.Since(marshalStart)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("encode result: %v", err)), nil
 		}
+		total := time.Since(t0)
+		slog.Info("mcp.runquery: handler exit",
+			"total_ms", total.Milliseconds(),
+			"runner_ms", runnerDur.Milliseconds(),
+			"marshal_ms", marshalDur.Milliseconds(),
+			"result_bytes", len(buf),
+		)
 		return mcp.NewToolResultText(string(buf)), nil
 	}
 }

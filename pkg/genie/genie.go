@@ -289,7 +289,20 @@ func (g *Genie) Query(ctx context.Context, req QueryRequest) (*Result, error) {
 	progress.Report(ctx, "Planning resolution against %q…", req.Provider)
 	start := time.Now()
 
+	// Phase split: parse vs execute. The executor's own per-node
+	// records (normalize/generate/tool_call/cache_*) live inside
+	// Execute; this top-level pair brackets them so a reader can
+	// see overall parse cost and overall execute cost without
+	// summing every internal entry.
+	parseStart := time.Now()
 	parsed, err := engine.Parse(req.Query)
+	parseDur := time.Since(parseStart)
+	g.session.AppendCtx(ctx, session.Record{
+		Call:       "phase",
+		Field:      "parse",
+		Provider:   req.Provider,
+		DurationMS: parseDur.Milliseconds(),
+	})
 	if err != nil {
 		g.session.AppendCtx(ctx, session.Record{
 			Call:       "query_end",
@@ -300,7 +313,15 @@ func (g *Genie) Query(ctx context.Context, req QueryRequest) (*Result, error) {
 		return nil, fmt.Errorf("parse: %w", err)
 	}
 
+	executeStart := time.Now()
 	out, err := bundle.executor.Execute(ctx, parsed)
+	executeDur := time.Since(executeStart)
+	g.session.AppendCtx(ctx, session.Record{
+		Call:       "phase",
+		Field:      "execute",
+		Provider:   req.Provider,
+		DurationMS: executeDur.Milliseconds(),
+	})
 	end := session.Record{
 		Call:       "query_end",
 		Provider:   req.Provider,
