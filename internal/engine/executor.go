@@ -314,6 +314,15 @@ func (e *Executor) attemptRetry(
 	if err != nil {
 		return "", nil, nil, err
 	}
+	// Pre-execution validation. Without this, a regen that emits a
+	// try/except (or any other forbidden pattern) compiles and runs
+	// fine — Python is happy — and the swallowed error surfaces as
+	// nulls in the output. Catching it here feeds the violation
+	// back as the next iteration's prevErr so the LLM gets a clear
+	// signal rather than chasing phantom shape bugs.
+	if violation := ValidateScript(newSrc); violation != "" {
+		return newSrc, newRename, nil, errors.New(violation)
+	}
 	mod, err := e.eng.Compile(newSrc)
 	if err != nil {
 		return newSrc, newRename, nil, fmt.Errorf("compile: %w", err)
