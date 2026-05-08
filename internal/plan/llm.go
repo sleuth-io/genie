@@ -1028,17 +1028,21 @@ type llmOutput struct {
 
 // parseLLMResponse extracts the JSON object from Claude's text response.
 // We instruct the model to return JSON only, but the SDK still returns
-// plain text — so we parse defensively, allowing for an optional code-fence
-// wrapper (```json ... ```).
+// plain text — so we parse defensively. Three cases handled:
 //
-// On strict-parse failure, retry with literal control chars inside string
-// values escaped. The model occasionally emits a real newline/CR/tab inside
-// the monty_script string value (technically invalid JSON per RFC 8259 §7,
-// but a frequent enough output mode that the retry path can't afford to
-// die on it — losing the regenerate response throws away a good script).
+//  1. Body is bare JSON: parse it.
+//  2. Body is a single fenced block (```json ... ```): strip the fence.
+//  3. Body has prose THEN a fenced JSON block (Opus 4.7 in particular
+//     likes to write a "Looking at this..." preamble): extract the
+//     fenced block from anywhere in the body.
+//
+// Followed by the literal-control-char-escape fallback for the
+// once-in-a-while case where the model emits a real newline inside
+// a JSON string value.
 func parseLLMResponse(text string) (*llmOutput, error) {
 	body := strings.TrimSpace(text)
 	body = stripCodeFence(body)
+	body = extractJSONObject(body)
 
 	var out llmOutput
 	err := json.Unmarshal([]byte(body), &out)
@@ -1053,6 +1057,41 @@ func parseLLMResponse(text string) (*llmOutput, error) {
 		return nil, errors.New("missing monty_script field")
 	}
 	return &out, nil
+}
+
+// extractJSONObject finds the JSON object embedded in s. If s already
+// starts with `{`, returns s. Otherwise looks for a fenced JSON block
+// (```json ... ``` or just ``` ... ```) anywhere in the body and
+// returns its contents. As a last fallback, returns the substring
+// from the first `{` to the last `}` — the loosest valid extraction
+// that still produces parseable JSON for the common case where the
+// model wraps a JSON object in prose.
+func extractJSONObject(s string) string {
+	t := strings.TrimSpace(s)
+	if strings.HasPrefix(t, "{") {
+		return t
+	}
+	// Look for a code-fenced block.
+	if start := strings.Index(t, "```"); start >= 0 {
+		// Skip the opening fence + optional language tag.
+		afterFence := t[start+3:]
+		if nl := strings.IndexByte(afterFence, '\n'); nl >= 0 {
+			afterFence = afterFence[nl+1:]
+		}
+		if end := strings.Index(afterFence, "```"); end >= 0 {
+			inner := strings.TrimSpace(afterFence[:end])
+			if strings.HasPrefix(inner, "{") {
+				return inner
+			}
+		}
+	}
+	// Fallback: substring between the first `{` and the last `}`.
+	first := strings.IndexByte(t, '{')
+	last := strings.LastIndexByte(t, '}')
+	if first >= 0 && last > first {
+		return t[first : last+1]
+	}
+	return t
 }
 
 // escapeUnescapedControlsInJSONStrings walks the JSON body and replaces
