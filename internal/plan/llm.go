@@ -261,6 +261,21 @@ func (g *Generator) synthesizeProjection(n *engine.Node, parent any, rename *eng
 	if len(n.Selection) == 0 {
 		return "", nil, false
 	}
+	// If the parent's value at this node is a scalar but the user
+	// requested an object selection (e.g. `author { displayName }`
+	// where the parent script projected `author: "Dylan Etkin"`),
+	// the synthesized projection would emit `parent.get("displayName")`
+	// against a string and crash. Bail out and let fullGenerate
+	// write a script that handles the wrap (or refuses) — that path
+	// can return `{requested_field: parent}` when the parent IS the
+	// human-readable value the user asked for.
+	switch parent.(type) {
+	case map[string]any, []any:
+		// fine — these are the shapes the synthesised projection
+		// already handles.
+	default:
+		return "", nil, false
+	}
 	keys := make([]synthKey, 0, len(n.Selection))
 	for _, child := range n.Selection {
 		if len(child.Selection) > 0 || len(child.Args) > 0 {
@@ -682,7 +697,17 @@ func (g *Generator) fullGenerateToolUse(ctx context.Context, n *engine.Node, par
 
 	tools := g.buildToolDefs()
 	messages := []llm.Message{{Role: "user", Text: userText}}
-	const maxRevisions = 1
+	// Revision policy: zero. The CLI driver's "revision" path
+	// re-spawns claude with the original conversation + a "you got
+	// it wrong" note appended, which forces the model to re-run the
+	// entire exploration from scratch (claude --print is stateless
+	// across invocations). The redo costs ~70-150s for a tiny
+	// chance of fixing the script. With the prompt's nested-
+	// selection guidance and synthesizeProjection's scalar bail,
+	// the first submit is usually correct OR clearly wrong; in
+	// either case we'd rather fail fast and let the caller retry
+	// (which gets a fresh L1/L2 lookup) than burn another minute.
+	const maxRevisions = 0
 
 	verifyArgs := map[string]any{}
 	for _, a := range n.Args {
@@ -754,9 +779,24 @@ func (g *Generator) fullGenerateToolUse(ctx context.Context, n *engine.Node, par
 		// Capture observations as fixtures (translate name to
 		// script-side canonical: github_X) AND record one session
 		// tool_call entry per observation for trace fidelity.
+		//
+		// Filter out claude-code built-ins (Bash, ToolSearch, Agent,
+		// Read, …) — --allowedTools is a positive allowlist that
+		// doesn't actually exclude built-ins, so they leak into the
+		// stream. We drop them at capture time so they don't pollute
+		// L2 fixtures or get attempted during verification replay.
+		// The script-side allowlist is g.toolNames (host names with
+		// the github_ prefix); anything outside it is noise.
+		upstreamSet := make(map[string]struct{}, len(g.toolNames))
+		for _, n := range g.toolNames {
+			upstreamSet[n] = struct{}{}
+		}
 		fixtureSet = fixtureSet[:0]
 		for _, obs := range result.Observations {
 			scriptName := translateObservationName(obs.ToolName, g.provider)
+			if _, ok := upstreamSet[scriptName]; !ok {
+				continue
+			}
 			fixtureSet.Append(scriptName, obs.Args, obs.Result)
 			g.session.AppendCtx(ctx, session.Record{
 				Call:     "tool_call",
@@ -1262,6 +1302,22 @@ need to:
 ## Hallucinated field names
 
 Hallucinated GraphQL field names are intentional: the user may request fields that do not exist on any real schema. Treat the field name as an intent signal — pick the closest sensible interpretation given the available tools and the arg list. If a requested field has no plausible mapping, return null for it; do not raise.
+
+## Match output shape to the GraphQL selection set
+
+The user's GraphQL selection tells you the SHAPE the script must return. Read the literal user node in your prompt and respect its structure:
+
+  - A bare scalar selection (` + "`{ login }`" + `) means return a value the engine can read at the field name. Object or string both work; the engine projects.
+  - A nested-object selection (` + "`{ author { displayName name } }`" + `) means the script's value at ` + "`author`" + ` MUST be a dict (or list of dicts), NOT a scalar. The engine recursively descends into the sub-object to project its children — if your script returned ` + "`author: \"Dylan Etkin\"`" + ` (string), the engine cannot extract ` + "`displayName`" + ` from that scalar and the user sees null.
+  - When the upstream tool only gives you the human-readable value at the parent level (e.g. you've already resolved an authorId to "Dylan Etkin"), wrap it: emit ` + "`author: {\"displayName\": \"Dylan Etkin\"}`" + ` so the nested selection has somewhere to project from.
+
+This applies to ` + "`expected_output`" + ` too: if your script returns nested objects, your expected_output's matching path must also be nested. Don't flatten in expected_output what the script keeps nested — verification compares them directly.
+
+Worked example:
+
+  Selection: ` + "`{ pages { title author { displayName } } }`" + `
+  WRONG return: ` + "`[{title: \"X\", author: \"Dylan Etkin\"}]`" + ` (author is a string; engine projects displayName from a string → null)
+  RIGHT return: ` + "`[{title: \"X\", author: {displayName: \"Dylan Etkin\"}}]`" + ` (engine descends into author, finds displayName)
 
 ## Resolve opaque identifiers when a human-readable field is requested
 
