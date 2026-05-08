@@ -330,15 +330,16 @@ func convertMessage(m Message) (anthropic.MessageParam, error) {
 			// never null. Coerce nil/empty inputs to {} so a
 			// model that called a parameterless tool round-trips
 			// safely on the next turn.
+			//
+			// NewToolUseBlock takes `any` and marshals it itself —
+			// passing a string here would produce a JSON string
+			// literal on the wire, not a JSON object. Pass the
+			// Go map directly.
 			inputVal := tu.Input
 			if inputVal == nil {
 				inputVal = map[string]any{}
 			}
-			input, err := json.Marshal(inputVal)
-			if err != nil {
-				return anthropic.MessageParam{}, fmt.Errorf("marshal tool_use input: %w", err)
-			}
-			blocks = append(blocks, anthropic.NewToolUseBlock(tu.ID, string(input), tu.Name))
+			blocks = append(blocks, anthropic.NewToolUseBlock(tu.ID, inputVal, tu.Name))
 		}
 		return anthropic.NewAssistantMessage(blocks...), nil
 	default:
