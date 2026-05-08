@@ -152,25 +152,18 @@ func (e *Executor) resolveNode(
 		}
 	}
 
-	// Null-sub-object short-circuit. If this is an object child
-	// (selection > 0) and the parent dict has either no entry at
-	// the canonical key, or an explicit null at it, the upstream
-	// returned no data for this sub-object — return null directly.
-	// Common cases that hit this path:
-	//   - `parent { ... }` on a top-level task with no parent
-	//   - `lead { ... }` on a project from a list endpoint that
-	//     doesn't expose lead without a separate fetch
-	//   - any nullable object reference whose owner cleared it
-	// The alternative is letting the LLM-driven Generate write a
-	// script that does parent.get(name) and returns None — same
-	// answer, paid in LLM tokens + wall time. Skip it.
-	if len(n.Selection) > 0 && parent != nil {
-		if obj, ok := parent.(map[string]any); ok {
-			v, present := obj[parentRename.canonicalChildName(n.Name)]
-			if !present || v == nil {
-				return nil, nil
-			}
-		}
+	// Null-sub-object short-circuit. composeOne (line ~376) already
+	// descends into parent[canonical(child.Name)] before calling
+	// resolveNode, so when we reach this point with parent==nil
+	// AND a parentRename (i.e. we're a CHILD node, not top-level),
+	// it means the upstream returned no data for this sub-object.
+	// Return null directly instead of paying for an LLM Generate.
+	//
+	// Top-level invocations have parent==nil AND parentRename==nil,
+	// so the parentRename guard keeps them on the normal Generate
+	// path.
+	if len(n.Selection) > 0 && parent == nil && parentRename != nil {
+		return nil, nil
 	}
 
 	shape := n.Shape()
