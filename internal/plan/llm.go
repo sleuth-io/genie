@@ -56,7 +56,7 @@ type Generator struct {
 	store                 *crystallize.Store
 	generateSystemToolUse []llm.SystemBlock
 	normalizeSystem       []llm.SystemBlock
-	toolNames             []string // monty-side names like github_list_pull_requests
+	toolNames             []string // monty-side names like tool_list_pull_requests
 	tools                 []mcp.Tool
 	provider              string // routing key — recorded in session entries
 	session               *session.Session
@@ -607,7 +607,7 @@ func (g *Generator) fullGenerateToolUse(ctx context.Context, n *engine.Node, par
 		g.metrics.CacheCreationInputTokens += result.Usage.CacheCreationTokens
 
 		// Capture observations as fixtures (translate name to
-		// script-side canonical: github_X) AND record one session
+		// script-side canonical: tool_X) AND record one session
 		// tool_call entry per observation for trace fidelity.
 		//
 		// Filter out claude-code built-ins (Bash, ToolSearch, Agent,
@@ -616,7 +616,7 @@ func (g *Generator) fullGenerateToolUse(ctx context.Context, n *engine.Node, par
 		// stream. We drop them at capture time so they don't pollute
 		// L2 fixtures or get attempted during verification replay.
 		// The script-side allowlist is g.toolNames (host names with
-		// the github_ prefix); anything outside it is noise.
+		// the tool_ prefix); anything outside it is noise.
 		upstreamSet := make(map[string]struct{}, len(g.toolNames))
 		for _, n := range g.toolNames {
 			upstreamSet[n] = struct{}{}
@@ -675,11 +675,11 @@ func (g *Generator) fullGenerateToolUse(ctx context.Context, n *engine.Node, par
 
 // mcpToolExecutor adapts mcpclient.Client to the llm.ToolExecutor
 // interface. The tool name the model emitted may carry the SDK-side
-// `github_` prefix or the CLI-side `mcp__<provider>__` prefix; both
+// `tool_` prefix or the CLI-side `mcp__<provider>__` prefix; both
 // are stripped before calling upstream.
 type mcpToolExecutor struct {
 	client         *mcpclient.Client
-	prefix         string // e.g. "github_"
+	prefix         string // e.g. "tool_"
 	providerPrefix string // e.g. "mcp__atlassian__"
 }
 
@@ -690,7 +690,7 @@ func (e *mcpToolExecutor) Call(ctx context.Context, name string, args map[string
 }
 
 // translateObservationName maps a model-facing tool name back to the
-// script-side canonical name (`github_<X>`). Both backends emit
+// script-side canonical name (`tool_<X>`). Both backends emit
 // observations with model-facing names; fixtures use script-side
 // names so verification replay matches the script's host calls.
 func translateObservationName(name, provider string) string {
@@ -1038,13 +1038,13 @@ Best-effort JSON-Schema-ish description of what the script returns. Used by down
 func renderToolCatalog(tools []mcp.Tool) string {
 	var b strings.Builder
 	b.WriteString("## Host function catalog\n\n")
-	b.WriteString("These are the host functions available inside the monty sandbox. Call each by its `github_<name>` name with kwargs only.\n\n")
+	b.WriteString("These are the host functions available inside the monty sandbox. Call each by its `tool_<name>` name with kwargs only.\n\n")
 
 	sorted := append([]mcp.Tool(nil), tools...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
 
 	for _, t := range sorted {
-		fmt.Fprintf(&b, "### github_%s\n", t.Name)
+		fmt.Fprintf(&b, "### tool_%s\n", t.Name)
 		if t.Description != "" {
 			fmt.Fprintf(&b, "%s\n", strings.TrimSpace(t.Description))
 		}

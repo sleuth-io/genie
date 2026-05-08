@@ -15,7 +15,7 @@ import (
 //
 // What goes into the record:
 //   - tool name (the host function the script invoked, e.g.
-//     "github_list_pull_requests")
+//     "tool_list_pull_requests")
 //   - args (the kwargs the script passed)
 //   - the full upstream tool result — raw API data the monty script
 //     consumes; never seen by the calling agent unmodified. Capturing

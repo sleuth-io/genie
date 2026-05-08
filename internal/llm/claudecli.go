@@ -219,12 +219,11 @@ func (c *claudeCLI) Drive(ctx context.Context, req DriveRequest) (LoopResult, er
 			if t.Name == req.SubmitToolName {
 				continue
 			}
-			// Strip Genie's monty-side prefix (e.g. github_) before
-			// applying claude's mcp__<provider>__ prefix.
-			bare := t.Name
-			if i := strings.Index(bare, "_"); i >= 0 && bare[:i+1] == "github_" {
-				bare = bare[i+1:]
-			}
+			// Strip Genie's monty-side `tool_` prefix before
+			// applying claude's mcp__<provider>__ prefix. (Kept
+			// as a literal to avoid pulling internal/mcpclient
+			// into the LLM layer.)
+			bare := strings.TrimPrefix(t.Name, "tool_")
 			names = append(names, "mcp__"+req.Provider+"__"+bare)
 		}
 		if len(names) > 0 {
@@ -249,14 +248,14 @@ In THIS conversation you call tools as `+"`mcp__%s__<name>`"+` — that is
 how claude's MCP machinery exposes them. Use that exact prefix when
 calling tools in your turns.
 
-In the SCRIPT you submit, call tools as `+"`github_<name>`"+` — that is
+In the SCRIPT you submit, call tools as `+"`tool_<name>`"+` — that is
 the host-function prefix the monty sandbox registers. The provider
-component is dropped in script-side names; the `+"`github_`"+` prefix is
+component is dropped in script-side names; the `+"`tool_`"+` prefix is
 hardcoded regardless of which provider you're using.
 
 So: same upstream tool, two names. During exploration here you'd call
 `+"`mcp__%s__getX`"+`. Inside your monty_script, you write
-`+"`github_getX(...)`"+`.
+`+"`tool_getX(...)`"+`.
 
 ### Submit by emitting JSON, not by calling a tool
 

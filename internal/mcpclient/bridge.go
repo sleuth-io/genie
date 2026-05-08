@@ -7,15 +7,18 @@ import (
 	"github.com/sleuth-io/genie/internal/runtime"
 )
 
-// HostNamePrefix is prepended to MCP tool names when they're exposed as
-// monty host functions. Makes it obvious in scripts which calls leave the
-// sandbox; also avoids collisions with future locally-registered helpers.
-const HostNamePrefix = "github_"
+// HostNamePrefix is prepended to upstream MCP tool names when they're
+// exposed as monty host functions. Provider-neutral: every provider's
+// tools (atlassian, github, linear, …) get the same `tool_` prefix.
+// Purpose: make it obvious in scripts which calls leave the sandbox,
+// and avoid collisions with locally-registered helpers (clock,
+// parallel, …).
+const HostNamePrefix = "tool_"
 
 // BuildHostFunctions adapts the client's tool catalog into a (BuiltIns,
 // BuiltInParams) pair suitable for runtime.Capabilities. Each MCP tool
 // becomes a host function callable from a monty script as
-// `github_<tool_name>(arg1=..., arg2=...)`.
+// `tool_<tool_name>(arg1=..., arg2=...)`.
 //
 // Arguments are passed through as a kwargs map to the MCP server. We
 // intentionally do NOT register positional parameter names: LLM-generated

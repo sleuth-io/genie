@@ -130,7 +130,7 @@ type LoopResult struct {
 }
 
 // Observation is one tool call the loop captured: the script-side
-// canonical name (e.g. "github_lookupJiraAccountId" — the name the
+// canonical name (e.g. "tool_lookupJiraAccountId" — the name the
 // generated monty script will use), the arguments, and the result.
 type Observation struct {
 	ToolName string
@@ -140,7 +140,7 @@ type Observation struct {
 
 // ToolExecutor abstracts upstream tool execution for SDK-style loop
 // drivers that need to run the model's tool calls themselves. The
-// name passed in is the model-facing tool name (e.g. "github_X");
+// name passed in is the model-facing tool name (e.g. "tool_X");
 // the implementation is responsible for any prefix translation
 // before reaching the upstream MCP server.
 type ToolExecutor interface {
