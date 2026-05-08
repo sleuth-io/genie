@@ -108,6 +108,33 @@ func (s Set) MergeFor(tool string) (any, bool) {
 	return mergeResults(results), true
 }
 
+// LookupFor is the args-aware replay primitive. Resolution order:
+//
+//  1. Exact-args match: if any capture has tool == name AND args
+//     deep-equal the supplied args (compared via stable JSON
+//     encoding), return that capture. This is the right answer
+//     when the script's call pattern matches the model's
+//     exploration — both resolved users one-at-a-time, both used
+//     the same JQL, etc.
+//  2. Merged fallback: when the script batches differently from
+//     exploration (script: one batched call; model: multiple
+//     small calls — or vice versa), return MergeFor's deep-merge
+//     so the script sees the union of observed data.
+//  3. Miss: (nil, false) when the tool has no captures at all.
+func (s Set) LookupFor(tool string, args map[string]any) (any, bool) {
+	wanted, _ := json.Marshal(args)
+	for _, f := range s {
+		if f.Tool != tool {
+			continue
+		}
+		got, _ := json.Marshal(f.Args)
+		if string(got) == string(wanted) {
+			return f.Response, true
+		}
+	}
+	return s.MergeFor(tool)
+}
+
 func mergeResults(results []any) any {
 	if len(results) == 0 {
 		return nil
@@ -175,10 +202,26 @@ func ReplayCapabilities(caps *runtime.Capabilities, set Set, upstreamTools []str
 	for _, n := range upstreamTools {
 		upstream[n] = struct{}{}
 	}
+	hasCaptureFor := func(tool string) bool {
+		for _, f := range set {
+			if f.Tool == tool {
+				return true
+			}
+		}
+		return false
+	}
+
 	wrapped := make(map[string]runtime.GoFunc, len(caps.BuiltIns))
-	for name, fn := range caps.BuiltIns {
-		if captured, ok := set.MergeFor(name); ok {
-			wrapped[name] = staticReplay(captured)
+	for name := range caps.BuiltIns {
+		fn := caps.BuiltIns[name]
+		if hasCaptureFor(name) {
+			toolName := name
+			wrapped[name] = func(_ context.Context, call *runtime.FunctionCall) (any, error) {
+				if resp, ok := set.LookupFor(toolName, call.Args); ok {
+					return resp, nil
+				}
+				return nil, fmt.Errorf("verification: no fixture for %q", toolName)
+			}
 			continue
 		}
 		if _, isUpstream := upstream[name]; isUpstream {
@@ -191,12 +234,6 @@ func ReplayCapabilities(caps *runtime.Capabilities, set Set, upstreamTools []str
 	out := *caps
 	out.BuiltIns = wrapped
 	return &out
-}
-
-func staticReplay(response any) runtime.GoFunc {
-	return func(_ context.Context, _ *runtime.FunctionCall) (any, error) {
-		return response, nil
-	}
 }
 
 func unexploredErr(name string) runtime.GoFunc {
