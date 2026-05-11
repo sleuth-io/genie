@@ -7,18 +7,10 @@ import (
 	"github.com/sleuth-io/genie/internal/runtime"
 )
 
-// HostNamePrefix is prepended to upstream MCP tool names when they're
-// exposed as monty host functions. Provider-neutral: every provider's
-// tools (atlassian, github, linear, …) get the same `tool_` prefix.
-// Purpose: make it obvious in scripts which calls leave the sandbox,
-// and avoid collisions with locally-registered helpers (clock,
-// parallel, …).
-const HostNamePrefix = "tool_"
-
 // BuildHostFunctions adapts the client's tool catalog into a (BuiltIns,
 // BuiltInParams) pair suitable for runtime.Capabilities. Each MCP tool
 // becomes a host function callable from a monty script as
-// `tool_<tool_name>(arg1=..., arg2=...)`.
+// `<provider>_<tool_name>(arg1=..., arg2=...)` — e.g. `atlassian_lookupX`.
 //
 // Arguments are passed through as a kwargs map to the MCP server. We
 // intentionally do NOT register positional parameter names: LLM-generated
@@ -28,9 +20,10 @@ const HostNamePrefix = "tool_"
 // Tool names are sanitized to be valid Python identifiers — MCP tool names
 // can in principle contain '-' which Python would reject.
 func BuildHostFunctions(c *Client) (map[string]runtime.GoFunc, map[string][]string) {
+	prefix := c.HostNamePrefix()
 	builtIns := make(map[string]runtime.GoFunc, len(c.Tools()))
 	for _, t := range c.Tools() {
-		name := HostNamePrefix + sanitize(t.Name)
+		name := prefix + sanitize(t.Name)
 		builtIns[name] = makeToolFunc(c, t.Name)
 	}
 	return builtIns, nil
@@ -39,9 +32,10 @@ func BuildHostFunctions(c *Client) (map[string]runtime.GoFunc, map[string][]stri
 // MontyToolNames returns the script-side names (post-prefix, post-sanitize)
 // in the same order as Tools(). Useful for dumping into prompts.
 func (c *Client) MontyToolNames() []string {
+	prefix := c.HostNamePrefix()
 	out := make([]string, 0, len(c.tools))
 	for _, t := range c.tools {
-		out = append(out, HostNamePrefix+sanitize(t.Name))
+		out = append(out, prefix+sanitize(t.Name))
 	}
 	return out
 }

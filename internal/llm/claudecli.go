@@ -219,11 +219,12 @@ func (c *claudeCLI) Drive(ctx context.Context, req DriveRequest) (LoopResult, er
 			if t.Name == req.SubmitToolName {
 				continue
 			}
-			// Strip Genie's monty-side `tool_` prefix before
-			// applying claude's mcp__<provider>__ prefix. (Kept
-			// as a literal to avoid pulling internal/mcpclient
-			// into the LLM layer.)
-			bare := strings.TrimPrefix(t.Name, "tool_")
+			// Strip Genie's monty-side `<provider>_` prefix
+			// before applying claude's `mcp__<provider>__`
+			// prefix. The two encode the same upstream tool
+			// in different conventions (single underscore vs
+			// double).
+			bare := strings.TrimPrefix(t.Name, req.Provider+"_")
 			names = append(names, "mcp__"+req.Provider+"__"+bare)
 		}
 		if len(names) > 0 {
@@ -244,31 +245,30 @@ func (c *claudeCLI) Drive(ctx context.Context, req DriveRequest) (LoopResult, er
 
 ### Tool names — DIFFERENT in chat vs in your script
 
-In THIS conversation you call tools as `+"`mcp__%s__<name>`"+` — that is
-how claude's MCP machinery exposes them. Use that exact prefix when
-calling tools in your turns.
+In THIS conversation you call tools as `+"`mcp__%[1]s__<name>`"+` — that
+is how claude's MCP machinery exposes them. Use that exact prefix
+when calling tools in your turns.
 
-In the SCRIPT you submit, call tools as `+"`tool_<name>`"+` — that is
-the host-function prefix the monty sandbox registers. The provider
-component is dropped in script-side names; the `+"`tool_`"+` prefix is
-hardcoded regardless of which provider you're using.
+In the SCRIPT you submit, call tools as `+"`%[1]s_<name>`"+` (the
+host-function prefix the monty sandbox registers — same provider
+component, different separator).
 
 So: same upstream tool, two names. During exploration here you'd call
-`+"`mcp__%s__getX`"+`. Inside your monty_script, you write
-`+"`tool_getX(...)`"+`.
+`+"`mcp__%[1]s__getX`"+`. Inside your monty_script, you write
+`+"`%[1]s_getX(...)`"+`.
 
 ### Submit by emitting JSON, not by calling a tool
 
-The synthetic %q tool is NOT available as a real tool here. When
+The synthetic %[2]q tool is NOT available as a real tool here. When
 you have finished exploring and would otherwise call it, terminate
 by writing your FINAL assistant message as ONLY a JSON object:
 
-    {%q: {<the input you'd pass>}}
+    {%[2]q: {<the input you'd pass>}}
 
 No prose around it. The first character of your final message must
 be `+"`{`"+` and the last must be `+"`}`"+`. Genie parses that
 message as the submission and runs verification.
-`, req.Provider, req.Provider, req.SubmitToolName, req.SubmitToolName)
+`, req.Provider, req.SubmitToolName)
 	}
 	args = append(args, "--system-prompt", sysBuilder.String())
 

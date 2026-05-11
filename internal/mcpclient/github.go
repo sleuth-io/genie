@@ -69,6 +69,32 @@ type Client struct {
 	tools        []mcp.Tool
 	serverInfo   mcp.Implementation
 	instructions string
+	// providerName is the name from ProviderSpec.Name (e.g.
+	// "atlassian", "github", "linear"). Used as the prefix when
+	// upstream tools are exposed as monty host functions, so a
+	// script reads `atlassian_lookupX(...)` rather than the
+	// generic `tool_X(...)`. Self-documenting in scripts + logs.
+	providerName string
+}
+
+// ProviderName is the provider identifier this client was opened
+// for. Used for host-name prefixing and observability.
+func (c *Client) ProviderName() string {
+	if c == nil {
+		return ""
+	}
+	return c.providerName
+}
+
+// HostNamePrefix is the script-side prefix applied to this
+// provider's tool names. Equals `<provider>_` (e.g. `atlassian_`).
+// Provider-neutral by construction: each provider gets its own
+// distinct prefix, no hardcoded names anywhere.
+func (c *Client) HostNamePrefix() string {
+	if c == nil || c.providerName == "" {
+		return ""
+	}
+	return sanitize(c.providerName) + "_"
 }
 
 // ServerInfo returns the MCP server's self-identification (name +
@@ -137,7 +163,7 @@ func openStdio(ctx context.Context, spec ProviderSpec) (*Client, error) {
 		return nil, err
 	}
 
-	return &Client{mcp: mc, tools: tools, serverInfo: info, instructions: instr}, nil
+	return &Client{mcp: mc, tools: tools, serverInfo: info, instructions: instr, providerName: spec.Name}, nil
 }
 
 func openHTTP(ctx context.Context, spec ProviderSpec) (*Client, error) {
@@ -195,7 +221,7 @@ func openHTTP(ctx context.Context, spec ProviderSpec) (*Client, error) {
 		return nil, err
 	}
 
-	return &Client{mcp: mc, tools: tools, serverInfo: info, instructions: instr}, nil
+	return &Client{mcp: mc, tools: tools, serverInfo: info, instructions: instr, providerName: spec.Name}, nil
 }
 
 func isOAuthRequired(err error) bool {

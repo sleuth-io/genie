@@ -56,7 +56,7 @@ type Generator struct {
 	store                 *crystallize.Store
 	generateSystemToolUse []llm.SystemBlock
 	normalizeSystem       []llm.SystemBlock
-	toolNames             []string // monty-side names like tool_list_pull_requests
+	toolNames             []string // monty-side names like github_list_pull_requests
 	tools                 []mcp.Tool
 	provider              string // routing key — recorded in session entries
 	session               *session.Session
@@ -114,7 +114,7 @@ func (g *Generator) NormalizeOnly(ctx context.Context, n *engine.Node) (string, 
 // on the Anthropic SDK; Claude Code's session default for the CLI).
 func NewGenerator(c *mcpclient.Client, store *crystallize.Store, llmClient llm.Client, provider string, sess *session.Session) *Generator {
 	tools := c.Tools()
-	catalog := renderToolCatalog(tools)
+	catalog := renderToolCatalog(tools, c.HostNamePrefix())
 
 	return &Generator{
 		client:                llmClient,
@@ -553,7 +553,7 @@ func (g *Generator) fullGenerateToolUse(ctx context.Context, n *engine.Node, par
 	progress.Report(ctx, "Generating script for %q (tool-use)…", n.Name)
 	ctx = llm.WithModel(ctx, g.generateModel)
 
-	executor := &mcpToolExecutor{client: g.mcp, prefix: mcpclient.HostNamePrefix, providerPrefix: "mcp__" + g.provider + "__"}
+	executor := &mcpToolExecutor{client: g.mcp, prefix: g.mcp.HostNamePrefix(), providerPrefix: "mcp__" + g.provider + "__"}
 
 	var fixtureSet fixtures.Set
 
@@ -607,7 +607,7 @@ func (g *Generator) fullGenerateToolUse(ctx context.Context, n *engine.Node, par
 		g.metrics.CacheCreationInputTokens += result.Usage.CacheCreationTokens
 
 		// Capture observations as fixtures (translate name to
-		// script-side canonical: tool_X) AND record one session
+		// script-side canonical: <provider>_X) AND record one session
 		// tool_call entry per observation for trace fidelity.
 		//
 		// Filter out claude-code built-ins (Bash, ToolSearch, Agent,
@@ -690,20 +690,21 @@ func (e *mcpToolExecutor) Call(ctx context.Context, name string, args map[string
 }
 
 // translateObservationName maps a model-facing tool name back to the
-// script-side canonical name (`tool_<X>`). Both backends emit
+// script-side canonical name (`<provider>_<X>`). Both backends emit
 // observations with model-facing names; fixtures use script-side
 // names so verification replay matches the script's host calls.
 func translateObservationName(name, provider string) string {
-	if strings.HasPrefix(name, mcpclient.HostNamePrefix) {
+	scriptPrefix := provider + "_"
+	if strings.HasPrefix(name, scriptPrefix) {
 		return name
 	}
 	if provider != "" {
-		prefix := "mcp__" + provider + "__"
-		if strings.HasPrefix(name, prefix) {
-			return mcpclient.HostNamePrefix + strings.TrimPrefix(name, prefix)
+		claudePrefix := "mcp__" + provider + "__"
+		if strings.HasPrefix(name, claudePrefix) {
+			return scriptPrefix + strings.TrimPrefix(name, claudePrefix)
 		}
 	}
-	return mcpclient.HostNamePrefix + name
+	return scriptPrefix + name
 }
 
 // verifySubmitted runs the submitted script with mocked capabilities
@@ -752,11 +753,12 @@ func (g *Generator) verifySubmitted(ctx context.Context, n *engine.Node, out *ll
 // monty host-name prefix, matching what the script will use) plus
 // the synthetic submit_script tool.
 func (g *Generator) buildToolDefs() []llm.ToolDef {
+	prefix := g.mcp.HostNamePrefix()
 	defs := make([]llm.ToolDef, 0, len(g.tools)+1)
 	for _, t := range g.tools {
 		schema := schemaToMap(t)
 		defs = append(defs, llm.ToolDef{
-			Name:        mcpclient.HostNamePrefix + sanitizeToolName(t.Name),
+			Name:        prefix + sanitizeToolName(t.Name),
 			Description: t.Description,
 			InputSchema: schema,
 		})
@@ -1034,17 +1036,18 @@ Best-effort JSON-Schema-ish description of what the script returns. Used by down
 
 // renderToolCatalog serialises the MCP tool list to a stable, prompt-friendly
 // string. Sort by name so the output bytes are deterministic — required for
-// prompt-cache hits across calls.
-func renderToolCatalog(tools []mcp.Tool) string {
+// prompt-cache hits across calls. hostPrefix is the per-provider script-side
+// prefix (e.g. "atlassian_") that scripts use to call into the sandbox.
+func renderToolCatalog(tools []mcp.Tool, hostPrefix string) string {
 	var b strings.Builder
 	b.WriteString("## Host function catalog\n\n")
-	b.WriteString("These are the host functions available inside the monty sandbox. Call each by its `tool_<name>` name with kwargs only.\n\n")
+	fmt.Fprintf(&b, "These are the host functions available inside the monty sandbox. Call each by its `%s<name>` name with kwargs only.\n\n", hostPrefix)
 
 	sorted := append([]mcp.Tool(nil), tools...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
 
 	for _, t := range sorted {
-		fmt.Fprintf(&b, "### tool_%s\n", t.Name)
+		fmt.Fprintf(&b, "### %s%s\n", hostPrefix, t.Name)
 		if t.Description != "" {
 			fmt.Fprintf(&b, "%s\n", strings.TrimSpace(t.Description))
 		}
