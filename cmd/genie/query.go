@@ -15,6 +15,7 @@ import (
 // configured providers, prints the JSON result, and exits.
 func runQuery(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("query", flag.ContinueOnError)
+	setUsage(fs, "Usage: genie query [--provider NAME] \"<graphql>\"")
 	provider := fs.String("provider", "github", "provider name (must match an entry in your config)")
 	if err := fs.Parse(args); err != nil {
 		return err

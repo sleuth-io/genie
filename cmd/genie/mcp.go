@@ -51,6 +51,8 @@ func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 
 func runMCPAdd(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("mcp add", flag.ContinueOnError)
+	setUsage(fs, `Usage: genie mcp add --name NAME (--url URL | --command "CMD [ARGS...]")
+       genie mcp add --json '{"name": "...", "url": "..."}'`)
 	configPath := fs.String("config", "", "override config path")
 	jsonStr := fs.String("json", "", "register a provider from a JSON object")
 
@@ -174,6 +176,7 @@ func runMCPAdd(ctx context.Context, args []string) error {
 
 func runMCPRemove(args []string) error {
 	fs := flag.NewFlagSet("mcp remove", flag.ContinueOnError)
+	setUsage(fs, "Usage: genie mcp remove NAME")
 	configPath := fs.String("config", "", "override config path")
 	keepCreds := fs.Bool("keep-credentials", false, "leave OAuth credentials in the keyring (default: drop them)")
 	if err := fs.Parse(args); err != nil {
@@ -213,6 +216,7 @@ func runMCPRemove(args []string) error {
 
 func runMCPList(args []string) error {
 	fs := flag.NewFlagSet("mcp list", flag.ContinueOnError)
+	setUsage(fs, "Usage: genie mcp list")
 	configPath := fs.String("config", "", "override config path")
 	if err := fs.Parse(args); err != nil {
 		return err

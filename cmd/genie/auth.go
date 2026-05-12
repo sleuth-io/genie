@@ -17,6 +17,7 @@ import (
 // `genie auth list` (show status of stored credentials).
 func runAuth(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("auth", flag.ContinueOnError)
+	setUsage(fs, "Usage: genie auth (list | <provider> | logout <provider>)")
 	configPath := fs.String("config", "", "override config path")
 	clientID := fs.String("client-id", "", "OAuth client ID (use when the server doesn't support dynamic registration)")
 	clientSecret := fs.String("client-secret", "", "OAuth client secret for confidential clients")
