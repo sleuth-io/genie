@@ -29,6 +29,7 @@ func runEval(ctx context.Context, args []string) error {
 		slog.Warn("eval: failed loading .env (continuing with process env)", "err", err)
 	}
 	fs := flag.NewFlagSet("eval", flag.ContinueOnError)
+	setUsage(fs, "Usage: genie eval [flags]")
 	intentsPath := fs.String("intents", "eval/intents.yaml", "path to intents YAML")
 	advPath := fs.String("adversarial", "eval/adversarial.yaml", "path to adversarial YAML")
 	dir := fs.String("crystallized", "./crystallized", "crystallized cache directory")

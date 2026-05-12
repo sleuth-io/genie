@@ -27,6 +27,7 @@ import (
 // ~/.claude.json user scope.
 func runMCPImport(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("mcp import", flag.ContinueOnError)
+	setUsage(fs, "Usage: genie mcp import [--all] [--dry-run] [--config PATH]")
 	configPath := fs.String("config", "", "override genie config path")
 	all := fs.Bool("all", false, "import every entry without prompting")
 	dryRun := fs.Bool("dry-run", false, "print what would be imported; don't write")
