@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 
 	"github.com/sleuth-io/genie/internal/runtime"
 )
@@ -348,13 +349,67 @@ func Diff(expected, actual any, path string) string {
 		}
 		return fmt.Sprintf("at %s: expected %q, got %v", pathOrRoot(path), e, actual)
 	default:
-		// numbers, booleans — fall back to fmt-equality (covers
-		// float64/int variations from JSON round-trip).
+		// Numeric scalars: relative-tolerance compare so that
+		// float-arithmetic ordering drift (e.g. 9.313641864960575 vs
+		// 9.313641864960577, one ULP apart) doesn't read as a
+		// divergence. The threshold is tight enough that any real
+		// script bug (>0.0001%) still trips it. Integers go through
+		// here too, exactly because float64(int) is exact for small
+		// magnitudes.
+		if ef, eok := numericValue(expected); eok {
+			if af, aok := numericValue(actual); aok {
+				if floatsClose(ef, af) {
+					return ""
+				}
+				return fmt.Sprintf("at %s: expected %v, got %v", pathOrRoot(path), expected, actual)
+			}
+		}
+		// Booleans, or numeric-vs-non-numeric — fall back to fmt-equality.
 		if fmt.Sprintf("%v", expected) == fmt.Sprintf("%v", actual) {
 			return ""
 		}
 		return fmt.Sprintf("at %s: expected %v, got %v", pathOrRoot(path), expected, actual)
 	}
+}
+
+// numericValue extracts a float64 from the numeric Go types JSON
+// round-trip can produce (and json.Number for streaming decoders).
+// Returns (0, false) for non-numeric values.
+func numericValue(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		if f, err := n.Float64(); err == nil {
+			return f, true
+		}
+		return 0, false
+	}
+	return 0, false
+}
+
+// floatsClose reports whether a and b are equal for verify purposes.
+// Combined tolerance: an absolute floor of 1e-12 covers near-zero
+// comparisons; a relative threshold of 1e-9 absorbs float-arithmetic
+// ordering noise (one-ULP drift is ~2e-16 — well under 1e-9) without
+// masking real script bugs (e.g. a 0.6% diff is 6e-3, far above).
+func floatsClose(a, b float64) bool {
+	if a == b {
+		return true
+	}
+	diff := math.Abs(a - b)
+	if diff <= 1e-12 {
+		return true
+	}
+	return diff <= 1e-9*math.Max(math.Abs(a), math.Abs(b))
 }
 
 func pathOrRoot(p string) string {
