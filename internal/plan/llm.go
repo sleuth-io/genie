@@ -527,17 +527,20 @@ func (g *Generator) fullGenerateToolUse(ctx context.Context, n *engine.Node, par
 
 	tools := g.buildToolDefs()
 	messages := []llm.Message{{Role: "user", Text: userText}}
-	// Revision policy: zero. The CLI driver's "revision" path
-	// re-spawns claude with the original conversation + a "you got
-	// it wrong" note appended, which forces the model to re-run the
-	// entire exploration from scratch (claude --print is stateless
-	// across invocations). The redo costs ~70-150s for a tiny
-	// chance of fixing the script. With the prompt's nested-
-	// selection guidance and synthesizeProjection's scalar bail,
-	// the first submit is usually correct OR clearly wrong; in
-	// either case we'd rather fail fast and let the caller retry
-	// (which gets a fresh L1/L2 lookup) than burn another minute.
-	const maxRevisions = 0
+	// Revision policy: 2. The verify phase deep-diffs the LLM's stated
+	// expected_output against what the submitted script actually
+	// produces against the recorded fixtures; the most common mismatch
+	// is a numeric hallucination in expected_output (LLM rounded
+	// mentally) or a defensive-shape script bug. Both are easy to fix
+	// with the diff visible — the model just needs another turn.
+	// Two attempts catches almost all of these; zero was too strict
+	// (genuine self-correctable mistakes nuked the whole query).
+	// Cost: with the Anthropic SDK backend, revisions reuse cached
+	// prompt prefixes and are cheap; with the claude CLI backend each
+	// revision re-spawns claude with the prior conversation appended
+	// (~70-150s), so 2 is the upper bound we're willing to spend on a
+	// cache-miss path that then crystallises for all future calls.
+	const maxRevisions = 2
 
 	verifyArgs := map[string]any{}
 	for _, a := range n.Args {
