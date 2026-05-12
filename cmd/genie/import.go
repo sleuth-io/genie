@@ -73,11 +73,16 @@ func runMCPImport(ctx context.Context, args []string) error {
 		}
 	}
 
+	// Names that are already in genie config but still in Claude Code
+	// are previously-half-finished migrations: the import succeeded but
+	// the cleanup prompt was declined or never offered (older versions
+	// of this command). Surface them now and offer to remove.
+	if err := cleanupAlreadyImported(scanner, skipped, *dryRun); err != nil {
+		return err
+	}
+
 	if len(candidates) == 0 {
-		fmt.Fprintln(os.Stderr, "No new MCP servers to import.")
-		if len(skipped) > 0 {
-			fmt.Fprintf(os.Stderr, "Already in genie config: %s\n", strings.Join(skipped, ", "))
-		}
+		fmt.Fprintln(os.Stderr, "\nNo new MCP servers to import.")
 		return maybeRegisterGenie(scanner, *dryRun)
 	}
 
@@ -106,10 +111,6 @@ func runMCPImport(ctx context.Context, args []string) error {
 		return maybeRegisterGenie(scanner, *dryRun)
 	}
 
-	type pendingDelete struct {
-		Name string
-		Loc  claudecode.Locations
-	}
 	imported := 0
 	var pendingDeletes []pendingDelete
 	for _, i := range picks {
@@ -177,7 +178,18 @@ func runMCPImport(ctx context.Context, args []string) error {
 		fmt.Fprintln(os.Stderr, "\nNothing imported.")
 	}
 
-	for _, p := range pendingDeletes {
+	processPendingDeletes(scanner, pendingDeletes)
+
+	return maybeRegisterGenie(scanner, false)
+}
+
+type pendingDelete struct {
+	Name string
+	Loc  claudecode.Locations
+}
+
+func processPendingDeletes(scanner *claudecode.Scanner, pending []pendingDelete) {
+	for _, p := range pending {
 		if p.Loc.UserScope {
 			if err := scanner.DeleteUserScopeMCPServer(p.Name); err != nil {
 				fmt.Fprintf(os.Stderr, "  ! could not remove %s from user-scope: %v\n", p.Name, err)
@@ -200,8 +212,44 @@ func runMCPImport(ctx context.Context, args []string) error {
 			}
 		}
 	}
+}
 
-	return maybeRegisterGenie(scanner, false)
+// cleanupAlreadyImported finds names that are already in genie's config
+// but still present somewhere in Claude Code, and offers to remove the
+// stale duplicate. Handles partial migrations from older runs (or from
+// declining the removal prompt the first time).
+func cleanupAlreadyImported(scanner *claudecode.Scanner, skipped []string, dryRun bool) error {
+	var header bool
+	for _, name := range skipped {
+		loc, err := scanner.LocationsOf(name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  ! could not locate %s in Claude Code: %v\n", name, err)
+			continue
+		}
+		if !loc.Any() {
+			continue
+		}
+		if !header {
+			fmt.Fprintln(os.Stderr, "Already in genie config but still in Claude Code:")
+			header = true
+		}
+		yes, err := promptYesNo(
+			fmt.Sprintf("  Remove %q from Claude Code (%s)?", name, formatLocations(loc, scanner.ProjectMCPPath)),
+			false,
+		)
+		if err != nil {
+			return err
+		}
+		if !yes {
+			continue
+		}
+		if dryRun {
+			fmt.Fprintf(os.Stderr, "    (dry-run) would remove %s from %s\n", name, formatLocations(loc, scanner.ProjectMCPPath))
+			continue
+		}
+		processPendingDeletes(scanner, []pendingDelete{{Name: name, Loc: loc}})
+	}
+	return nil
 }
 
 // formatLocations renders a Locations as a human-readable list for the
