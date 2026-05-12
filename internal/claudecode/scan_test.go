@@ -282,6 +282,168 @@ func TestDeleteUserScopeMCPServer_MissingIsNoOp(t *testing.T) {
 	}
 }
 
+func TestLocationsOf_AllThreeScopes(t *testing.T) {
+	dir := t.TempDir()
+	cwd := filepath.Join(dir, "proj")
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	claudeJSON := filepath.Join(dir, ".claude.json")
+	writeJSON(t, claudeJSON, map[string]any{
+		"mcpServers": map[string]any{
+			"shared": map[string]any{"url": "https://us"},
+		},
+		"projects": map[string]any{
+			cwd: map[string]any{
+				"mcpServers": map[string]any{
+					"shared":    map[string]any{"url": "https://pl"},
+					"only-here": map[string]any{"url": "https://x"},
+				},
+			},
+		},
+	})
+	writeJSON(t, filepath.Join(cwd, ".mcp.json"), map[string]any{
+		"mcpServers": map[string]any{
+			"shared":    map[string]any{"url": "https://pf"},
+			"file-only": map[string]any{"url": "https://y"},
+		},
+	})
+	s := &Scanner{
+		ClaudeJSONPath: claudeJSON,
+		ProjectMCPPath: filepath.Join(cwd, ".mcp.json"),
+		CWD:            cwd,
+	}
+
+	cases := []struct {
+		name string
+		want Locations
+	}{
+		{"shared", Locations{UserScope: true, ProjectLocal: true, ProjectFile: true}},
+		{"only-here", Locations{ProjectLocal: true}},
+		{"file-only", Locations{ProjectFile: true}},
+		{"nonexistent", Locations{}},
+	}
+	for _, c := range cases {
+		got, err := s.LocationsOf(c.name)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got != c.want {
+			t.Errorf("LocationsOf(%q) = %+v, want %+v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestDeleteProjectLocalMCPServer_PreservesProjectState(t *testing.T) {
+	dir := t.TempDir()
+	cwd := filepath.Join(dir, "proj")
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	claudeJSON := filepath.Join(dir, ".claude.json")
+	writeJSON(t, claudeJSON, map[string]any{
+		"someOtherKey": "preserved",
+		"projects": map[string]any{
+			cwd: map[string]any{
+				"mcpServers": map[string]any{
+					"linear":    map[string]any{"url": "https://linear"},
+					"admin-mcp": map[string]any{"url": "https://admin"},
+				},
+				"history":      []string{"cmd1", "cmd2"},
+				"allowedTools": []string{"Bash"},
+			},
+			"/other/project": map[string]any{
+				"mcpServers": map[string]any{
+					"other": map[string]any{"url": "https://other"},
+				},
+			},
+		},
+	})
+	s := &Scanner{ClaudeJSONPath: claudeJSON, ProjectMCPPath: filepath.Join(cwd, ".mcp.json"), CWD: cwd}
+	if err := s.DeleteProjectLocalMCPServer("linear"); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, _ := os.ReadFile(claudeJSON)
+	var top map[string]any
+	if err := json.Unmarshal(raw, &top); err != nil {
+		t.Fatal(err)
+	}
+	if top["someOtherKey"] != "preserved" {
+		t.Error("top-level someOtherKey lost")
+	}
+	proj := top["projects"].(map[string]any)[cwd].(map[string]any)
+	servers := proj["mcpServers"].(map[string]any)
+	if _, ok := servers["linear"]; ok {
+		t.Error("linear not deleted")
+	}
+	if _, ok := servers["admin-mcp"]; !ok {
+		t.Error("admin-mcp lost from project-local")
+	}
+	if _, ok := proj["history"]; !ok {
+		t.Error("project history key lost")
+	}
+	if _, ok := proj["allowedTools"]; !ok {
+		t.Error("project allowedTools key lost")
+	}
+	otherProj := top["projects"].(map[string]any)["/other/project"].(map[string]any)
+	if _, ok := otherProj["mcpServers"].(map[string]any)["other"]; !ok {
+		t.Error("sibling project's MCP entry lost")
+	}
+}
+
+func TestDeleteProjectFileMCPServer_PreservesNeighbours(t *testing.T) {
+	dir := t.TempDir()
+	cwd := filepath.Join(dir, "proj")
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mcpPath := filepath.Join(cwd, ".mcp.json")
+	writeJSON(t, mcpPath, map[string]any{
+		"mcpServers": map[string]any{
+			"linear":     map[string]any{"type": "sse", "url": "https://linear", "_artifact": "linear"},
+			"playwright": map[string]any{"command": "npx", "args": []string{"@playwright/mcp@latest"}},
+		},
+	})
+	s := &Scanner{ClaudeJSONPath: filepath.Join(dir, ".claude.json"), ProjectMCPPath: mcpPath, CWD: cwd}
+	if err := s.DeleteProjectFileMCPServer("linear"); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(mcpPath)
+	var top map[string]any
+	if err := json.Unmarshal(raw, &top); err != nil {
+		t.Fatal(err)
+	}
+	servers := top["mcpServers"].(map[string]any)
+	if _, ok := servers["linear"]; ok {
+		t.Error("linear not deleted from .mcp.json")
+	}
+	pw, ok := servers["playwright"].(map[string]any)
+	if !ok || pw["command"] != "npx" {
+		t.Errorf("playwright entry disturbed: %v", servers["playwright"])
+	}
+}
+
+func TestDeleteProjectFileMCPServer_MissingFileIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	cwd := filepath.Join(dir, "proj")
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := &Scanner{
+		ClaudeJSONPath: filepath.Join(dir, ".claude.json"),
+		ProjectMCPPath: filepath.Join(cwd, ".mcp.json"),
+		CWD:            cwd,
+	}
+	if err := s.DeleteProjectFileMCPServer("anything"); err != nil {
+		t.Fatalf("delete on missing file should be no-op, got: %v", err)
+	}
+	// Should NOT create the file just for an empty delete.
+	if _, err := os.Stat(s.ProjectMCPPath); err == nil {
+		t.Error(".mcp.json created unnecessarily")
+	}
+}
+
 func writeJSON(t *testing.T, path string, v any) {
 	t.Helper()
 	buf, err := json.MarshalIndent(v, "", "  ")

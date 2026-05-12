@@ -106,8 +106,12 @@ func runMCPImport(ctx context.Context, args []string) error {
 		return maybeRegisterGenie(scanner, *dryRun)
 	}
 
+	type pendingDelete struct {
+		Name string
+		Loc  claudecode.Locations
+	}
 	imported := 0
-	var deleteFromUserScope []string
+	var pendingDeletes []pendingDelete
 	for _, i := range picks {
 		e := candidates[i]
 		prov := mapEntry(e)
@@ -139,19 +143,27 @@ func runMCPImport(ctx context.Context, args []string) error {
 		imported++
 		fmt.Fprintf(os.Stderr, "  ✓ %s [%s]\n", e.Name, e.Source)
 
-		// Defer the Claude-Code-side deletion until after genie's
-		// config is saved. Otherwise a Save failure leaves the user
-		// with no entry on either side.
-		if e.Source == claudecode.SourceUserScope {
+		// Find every Claude Code scope where this name lives. The
+		// entry we selected has its own Source, but the same name may
+		// also be present in lower-precedence scopes (e.g. selected
+		// from project-file but also in user-scope). Offering deletion
+		// across all of them is what "I'm migrating to genie" means.
+		// Defer the actual deletion until after genie's config Save
+		// succeeds, so a save failure doesn't strand the user with no
+		// entry on either side.
+		loc, err := scanner.LocationsOf(e.Name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "    ! could not locate %s in Claude Code: %v\n", e.Name, err)
+		} else if loc.Any() {
 			yes, err := promptYesNo(
-				fmt.Sprintf("    Remove %q from Claude Code user-scope (so only genie talks to it)?", e.Name),
+				fmt.Sprintf("    Remove %q from Claude Code (%s)?", e.Name, formatLocations(loc, scanner.ProjectMCPPath)),
 				false,
 			)
 			if err != nil {
 				return err
 			}
 			if yes {
-				deleteFromUserScope = append(deleteFromUserScope, e.Name)
+				pendingDeletes = append(pendingDeletes, pendingDelete{Name: e.Name, Loc: loc})
 			}
 		}
 	}
@@ -165,15 +177,48 @@ func runMCPImport(ctx context.Context, args []string) error {
 		fmt.Fprintln(os.Stderr, "\nNothing imported.")
 	}
 
-	for _, name := range deleteFromUserScope {
-		if err := scanner.DeleteUserScopeMCPServer(name); err != nil {
-			fmt.Fprintf(os.Stderr, "  ! could not remove %s from %s: %v\n", name, scanner.ClaudeJSONPath, err)
-			continue
+	for _, p := range pendingDeletes {
+		if p.Loc.UserScope {
+			if err := scanner.DeleteUserScopeMCPServer(p.Name); err != nil {
+				fmt.Fprintf(os.Stderr, "  ! could not remove %s from user-scope: %v\n", p.Name, err)
+			} else {
+				fmt.Fprintf(os.Stderr, "  ↳ removed %s from user-scope (%s)\n", p.Name, scanner.ClaudeJSONPath)
+			}
 		}
-		fmt.Fprintf(os.Stderr, "  ↳ removed %s from %s\n", name, scanner.ClaudeJSONPath)
+		if p.Loc.ProjectLocal {
+			if err := scanner.DeleteProjectLocalMCPServer(p.Name); err != nil {
+				fmt.Fprintf(os.Stderr, "  ! could not remove %s from project-local: %v\n", p.Name, err)
+			} else {
+				fmt.Fprintf(os.Stderr, "  ↳ removed %s from project-local\n", p.Name)
+			}
+		}
+		if p.Loc.ProjectFile {
+			if err := scanner.DeleteProjectFileMCPServer(p.Name); err != nil {
+				fmt.Fprintf(os.Stderr, "  ! could not remove %s from %s: %v\n", p.Name, scanner.ProjectMCPPath, err)
+			} else {
+				fmt.Fprintf(os.Stderr, "  ↳ removed %s from %s\n", p.Name, scanner.ProjectMCPPath)
+			}
+		}
 	}
 
 	return maybeRegisterGenie(scanner, false)
+}
+
+// formatLocations renders a Locations as a human-readable list for the
+// removal prompt. Project-file is annotated as "committed" so the user
+// knows the delete will modify a tracked file.
+func formatLocations(loc claudecode.Locations, projectMCPPath string) string {
+	var parts []string
+	if loc.UserScope {
+		parts = append(parts, "user-scope")
+	}
+	if loc.ProjectLocal {
+		parts = append(parts, "project-local")
+	}
+	if loc.ProjectFile {
+		parts = append(parts, fmt.Sprintf("%s — committed", projectMCPPath))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func mapEntry(e claudecode.Entry) config.ProviderConfig {
