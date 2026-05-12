@@ -21,13 +21,14 @@ import (
 //	genie mcp add --json '{"name": "...", "url": "..."}'
 //	genie mcp remove NAME
 //	genie mcp list
+//	genie mcp import
 //
 // `add` for an HTTP URL automatically runs the OAuth flow once the
 // entry is saved, so adding an MCP server is a single command end to
-// end.
+// end. `import` pulls existing entries from Claude Code's config.
 func runMCP(ctx context.Context, args []string) error {
 	if len(args) < 1 {
-		return errors.New(`usage: genie mcp [add|remove|list] [args]`)
+		return errors.New(`usage: genie mcp [add|remove|list|import] [args]`)
 	}
 	switch args[0] {
 	case "add":
@@ -36,6 +37,8 @@ func runMCP(ctx context.Context, args []string) error {
 		return runMCPRemove(args[1:])
 	case "list", "ls":
 		return runMCPList(args[1:])
+	case "import":
+		return runMCPImport(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown mcp subcommand %q", args[0])
 	}
