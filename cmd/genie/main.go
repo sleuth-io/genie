@@ -69,6 +69,7 @@ Usage:
   genie mcp add -n NAME -c "CMD [ARGS...]"    add a stdio provider
   genie mcp list                              list configured providers
   genie mcp remove NAME                       drop a provider
+  genie mcp import                            import MCP servers from Claude Code
   genie auth <provider>     re-run the OAuth flow for an http/sse provider
   genie auth list           show auth status for each provider
   genie query "<graphql>"   resolve one query, print JSON
